@@ -10,9 +10,8 @@
 
 use pathfinder_content::outline::ContourIterFlags;
 use pathfinder_content::segment::SegmentKind;
-use pathfinder_renderer::paint::Paint;
-use pathfinder_renderer::scene::Scene;
 use pathfinder_geometry::vector::{Vector2F, vec2f};
+use pathfinder_renderer::scene::{DrawPath, Scene};
 use std::fmt;
 use std::io::{self, Write};
 
@@ -54,7 +53,8 @@ fn export_svg<W: Write>(scene: &Scene, writer: &mut W) -> io::Result<()> {
         view_box.size().x(),
         view_box.size().y()
     )?;
-    for (paint, outline, name) in scene.paths() {
+    for &DrawPath { paint: paint_id, ref outline, ref name, .. } in scene.draw_paths() {
+        let paint = scene.palette().paints.get(paint_id.0 as usize).unwrap();
         write!(writer, "    <path")?;
         if !name.is_empty() {
             write!(writer, " id=\"{}\"", name)?;
@@ -76,15 +76,11 @@ fn export_pdf<W: Write>(scene: &Scene, writer: &mut W) -> io::Result<()> {
         vec2f(r.x(), height - r.y())
     };
 
-    for (paint, outline, _) in scene.paths() {
-        match paint {
-            Paint::Color(color) => pdf.set_fill_color(*color),
-            Paint::Gradient(_) => {
-                // TODO(pcwalton): Gradients.
-            }
-            Paint::Pattern(_) => {
-                // TODO(pcwalton): Patterns.
-            }
+    for &DrawPath { paint: paint_id, ref outline, .. } in scene.draw_paths() {
+        // TODO(pcwalton): Gradients and patterns.
+        let paint = scene.palette().paints.get(paint_id.0 as usize).unwrap();
+        if paint.is_color() {
+            pdf.set_fill_color(paint.base_color());
         }
 
         for contour in outline.contours() {
@@ -144,7 +140,7 @@ fn export_ps<W: Write>(scene: &Scene, writer: &mut W) -> io::Result<()> {
     writeln!(writer, "0 {} translate", view_box.size().y())?;
     writeln!(writer, "1 -1 scale")?;
 
-    for (paint, outline, name) in scene.paths() {
+    for &DrawPath { paint: paint_id, ref outline, ref name, .. } in scene.draw_paths() {
         if !name.is_empty() {
             writeln!(writer, "newpath % {}", name)?;
         } else {
@@ -185,16 +181,11 @@ fn export_ps<W: Write>(scene: &Scene, writer: &mut W) -> io::Result<()> {
             }
         }
 
-        match paint {
-            Paint::Color(color) => {
-                writeln!(writer, "{} {} {} setrgbcolor", color.r, color.g, color.b)?;
-            }
-            Paint::Gradient(_) => {
-                // TODO(pcwalton): Gradients.
-            }
-            Paint::Pattern(_) => {
-                // TODO(pcwalton): Patterns.
-            }
+        // TODO(pcwalton): Gradients and patterns.
+        let paint = scene.palette().paints.get(paint_id.0 as usize).unwrap();
+        if paint.is_color() {
+            let color = paint.base_color();
+            writeln!(writer, "{} {} {} setrgbcolor", color.r, color.g, color.b)?;
         }
 
         writeln!(writer, "fill")?;

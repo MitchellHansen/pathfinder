@@ -10,7 +10,7 @@
 
 //! A compressed in-memory representation of paths.
 
-use crate::clip::{self, ContourPolygonClipper, ContourRectClipper};
+use crate::clip::{self, ContourPolygonClipper};
 use crate::dilation::ContourDilator;
 use crate::orientation::Orientation;
 use crate::segment::{Segment, SegmentFlags, SegmentKind};
@@ -57,6 +57,15 @@ impl Outline {
     pub fn new() -> Outline {
         Outline {
             contours: vec![],
+            bounds: RectF::default(),
+        }
+    }
+
+    /// Returns a new `Outline` with storage for `capacity` contours preallocated.
+    #[inline]
+    pub fn with_capacity(capacity: usize) -> Outline {
+        Outline {
+            contours: Vec::with_capacity(capacity),
             bounds: RectF::default(),
         }
     }
@@ -178,6 +187,11 @@ impl Outline {
         self.bounds = new_bounds.unwrap_or_else(|| RectF::default());
     }
 
+    pub fn transformed(mut self, transform: &Transform2F) -> Outline {
+        self.transform(transform);
+        self
+    }
+
     pub fn apply_perspective(&mut self, perspective: &Perspective) {
         let mut new_bounds = None;
         for contour in &mut self.contours {
@@ -193,16 +207,6 @@ impl Outline {
             .iter_mut()
             .for_each(|contour| contour.dilate(amount, orientation));
         self.bounds = self.bounds.dilate(amount);
-    }
-
-    pub fn prepare_for_tiling(&mut self, view_box: RectF) {
-        self.contours
-            .iter_mut()
-            .for_each(|contour| contour.prepare_for_tiling(view_box));
-        self.bounds = self
-            .bounds
-            .intersection(view_box)
-            .unwrap_or_else(|| RectF::default());
     }
 
     pub fn is_outside_polygon(&self, clip_polygon: &[Vector2F]) -> bool {
@@ -224,19 +228,35 @@ impl Outline {
         }
     }
 
-    pub fn clip_against_rect(&mut self, clip_rect: RectF) {
-        if clip_rect.contains_rect(self.bounds) {
-            return;
-        }
-
-        for contour in mem::replace(&mut self.contours, vec![]) {
-            self.push_contour(ContourRectClipper::new(clip_rect, contour).clip());
-        }
-    }
-
     #[inline]
     pub fn close_all_contours(&mut self) {
         self.contours.iter_mut().for_each(|contour| contour.close());
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.contours.iter().all(Contour::is_empty)
+    }
+
+    /// Returns the number of contours in this outline.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.contours.len()
+    }
+
+    /// Appends the contours in another outline to this one.
+    pub fn push_outline(&mut self, other: Outline) {
+        if other.is_empty() {
+            return;
+        }
+
+        if self.is_empty() {
+            self.bounds = other.bounds;
+        } else {
+            self.bounds = self.bounds.union_rect(other.bounds);
+        }
+
+        self.contours.extend(other.contours);
     }
 }
 
@@ -275,7 +295,7 @@ impl Contour {
 
     #[inline]
     pub fn from_rect(rect: RectF) -> Contour {
-        let mut contour = Contour::new();
+        let mut contour = Contour::with_capacity(4);
         contour.push_point(rect.origin(), PointFlags::empty(), false);
         contour.push_point(rect.upper_right(), PointFlags::empty(), false);
         contour.push_point(rect.lower_right(), PointFlags::empty(), false);
@@ -351,6 +371,11 @@ impl Contour {
     #[inline]
     pub(crate) fn position_of_last(&self, index: u32) -> Vector2F {
         self.points[self.points.len() - index as usize]
+    }
+
+    #[inline]
+    pub fn flags_of(&self, index: u32) -> PointFlags {
+        self.flags[index as usize]
     }
 
     #[inline]
@@ -609,6 +634,12 @@ impl Contour {
         }
     }
 
+    #[inline]
+    pub fn transformed(mut self, transform: &Transform2F) -> Contour {
+        self.transform(transform);
+        self
+    }
+
     pub fn apply_perspective(&mut self, perspective: &Perspective) {
         for (point_index, point) in self.points.iter_mut().enumerate() {
             *point = *perspective * *point;
@@ -619,149 +650,6 @@ impl Contour {
     pub fn dilate(&mut self, amount: Vector2F, orientation: Orientation) {
         ContourDilator::new(self, amount, orientation).dilate();
         self.bounds = self.bounds.dilate(amount);
-    }
-
-    fn prepare_for_tiling(&mut self, view_box: RectF) {
-        // Snap points to the view box bounds. This mops up floating point error from the clipping
-        // process.
-        let (mut last_endpoint_index, mut contour_is_monotonic) = (None, true);
-        for point_index in 0..(self.points.len() as u32) {
-            if contour_is_monotonic {
-                if self.point_is_endpoint(point_index) {
-                    if let Some(last_endpoint_index) = last_endpoint_index {
-                        if !self.curve_with_endpoints_is_monotonic(last_endpoint_index,
-                                                                   point_index) {
-                            contour_is_monotonic = false;
-                        }
-                    }
-                    last_endpoint_index = Some(point_index);
-                }
-            }
-        }
-
-        // Convert to monotonic, if necessary.
-        if !contour_is_monotonic {
-            self.make_monotonic();
-        }
-
-        // Update bounds.
-        self.bounds = self
-            .bounds
-            .intersection(view_box)
-            .unwrap_or_else(|| RectF::default());
-    }
-
-    fn make_monotonic(&mut self) {
-        debug!("--- make_monotonic() ---");
-
-        let contour = self.take();
-        self.bounds = contour.bounds;
-
-        let mut last_endpoint_index = None;
-        let input_point_count = contour.points.len() as u32;
-        for point_index in 0..(input_point_count + 1) {
-            if point_index < input_point_count && !contour.point_is_endpoint(point_index) {
-                continue;
-            }
-
-            if let Some(last_endpoint_index) = last_endpoint_index {
-                let position_index = if point_index == input_point_count {
-                    0
-                } else {
-                    point_index
-                };
-                let baseline = LineSegment2F::new(
-                    contour.points[last_endpoint_index as usize],
-                    contour.points[position_index as usize],
-                );
-                let point_count = point_index - last_endpoint_index + 1;
-                if point_count == 3 {
-                    let ctrl_point_index = last_endpoint_index as usize + 1;
-                    let ctrl_position = &contour.points[ctrl_point_index];
-                    handle_cubic(
-                        self,
-                        &Segment::quadratic(baseline, *ctrl_position).to_cubic(),
-                    );
-                } else if point_count == 4 {
-                    let first_ctrl_point_index = last_endpoint_index as usize + 1;
-                    let ctrl_position_0 = &contour.points[first_ctrl_point_index + 0];
-                    let ctrl_position_1 = &contour.points[first_ctrl_point_index + 1];
-                    let ctrl = LineSegment2F::new(*ctrl_position_0, *ctrl_position_1);
-                    handle_cubic(self, &Segment::cubic(baseline, ctrl));
-                }
-
-                self.push_point(
-                    contour.points[position_index as usize],
-                    PointFlags::empty(),
-                    false,
-                );
-            }
-
-            last_endpoint_index = Some(point_index);
-        }
-
-        fn handle_cubic(contour: &mut Contour, segment: &Segment) {
-            debug!("handle_cubic({:?})", segment);
-
-            match segment.as_cubic_segment().y_extrema() {
-                (Some(t0), Some(t1)) => {
-                    let (segments_01, segment_2) = segment.as_cubic_segment().split(t1);
-                    let (segment_0, segment_1) = segments_01.as_cubic_segment().split(t0 / t1);
-                    contour.push_segment(&segment_0, PushSegmentFlags::empty());
-                    contour.push_segment(&segment_1, PushSegmentFlags::empty());
-                    contour.push_segment(&segment_2, PushSegmentFlags::empty());
-                }
-                (Some(t0), None) | (None, Some(t0)) => {
-                    let (segment_0, segment_1) = segment.as_cubic_segment().split(t0);
-                    contour.push_segment(&segment_0, PushSegmentFlags::empty());
-                    contour.push_segment(&segment_1, PushSegmentFlags::empty());
-                }
-                (None, None) => contour.push_segment(segment, PushSegmentFlags::empty()),
-            }
-        }
-    }
-
-    fn curve_with_endpoints_is_monotonic(
-        &self,
-        start_endpoint_index: u32,
-        end_endpoint_index: u32,
-    ) -> bool {
-        let start_position = self.points[start_endpoint_index as usize];
-        let end_position = self.points[end_endpoint_index as usize];
-
-        if start_position.x() <= end_position.x() {
-            for point_index in start_endpoint_index..end_endpoint_index {
-                if self.points[point_index as usize].x() > self.points[point_index as usize + 1].x()
-                {
-                    return false;
-                }
-            }
-        } else {
-            for point_index in start_endpoint_index..end_endpoint_index {
-                if self.points[point_index as usize].x() < self.points[point_index as usize + 1].x()
-                {
-                    return false;
-                }
-            }
-        }
-
-        if start_position.y() <= end_position.y() {
-            for point_index in start_endpoint_index..end_endpoint_index {
-                if self.points[point_index as usize].y() > self.points[point_index as usize + 1].y()
-                {
-                    return false;
-                }
-            }
-        } else {
-            for point_index in start_endpoint_index..end_endpoint_index {
-                if self.points[point_index as usize].y() < self.points[point_index as usize + 1].y()
-                {
-                    return false;
-                }
-            }
-        }
-
-        true
     }
 
     // Use this function to keep bounds up to date when mutating paths. See `Outline::transform()`

@@ -8,48 +8,67 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use crate::sorted_vector::SortedVector;
 use crate::util;
 use pathfinder_color::ColorU;
 use pathfinder_geometry::line_segment::LineSegment2F;
+use pathfinder_geometry::transform2d::Transform2F;
 use pathfinder_geometry::vector::Vector2F;
 use pathfinder_geometry::util as geometry_util;
 use pathfinder_simd::default::F32x2;
-use std::cmp::{Ordering, PartialOrd};
+use std::cmp::Ordering;
 use std::convert;
 use std::hash::{Hash, Hasher};
 use std::mem;
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Gradient {
-    /// The line this gradient runs along.
-    /// 
-    /// If this is a radial gradient, this is the line that connects the two circles. It may have
-    /// zero-length in the case of simple radial gradients.
-    pub line: LineSegment2F,
-    /// For radial gradients, the radii of the start and endpoints respectively. If this is a
-    /// linear gradient, this is `None`.
-    pub radii: Option<F32x2>,
-    stops: SortedVector<ColorStop>,
+    pub geometry: GradientGeometry,
+    stops: Vec<ColorStop>,
 }
 
-#[derive(Clone, Copy, PartialEq, PartialOrd, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct ColorStop {
     pub offset: f32,
     pub color: ColorU,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum GradientGeometry {
+    Linear(LineSegment2F),
+    Radial {
+        /// The line that connects the two circles. It may have zero length for simple radial
+        /// gradients.
+        line: LineSegment2F,
+        /// The radii of the two circles. The first value may be zero.
+        radii: F32x2,
+        /// Transform from radial gradient space into screen space.
+        ///
+        /// Like `gradientTransform` in SVG. Note that this is the inverse of Cairo's gradient
+        /// transform.
+        transform: Transform2F,
+    }
 }
 
 impl Eq for Gradient {}
 
 impl Hash for Gradient {
     fn hash<H>(&self, state: &mut H) where H: Hasher {
-        util::hash_line_segment(self.line, state);
-        match self.radii {
-            None => (0).hash(state),
-            Some(radii) => {
+        match self.geometry {
+            GradientGeometry::Linear(line) => {
+                (0).hash(state);
+                util::hash_line_segment(line, state);
+            }
+            GradientGeometry::Radial { line, radii, transform } => {
                 (1).hash(state);
+                util::hash_line_segment(line, state);
                 util::hash_f32(radii.x(), state);
                 util::hash_f32(radii.y(), state);
+                util::hash_f32(transform.m11(), state);
+                util::hash_f32(transform.m12(), state);
+                util::hash_f32(transform.m13(), state);
+                util::hash_f32(transform.m21(), state);
+                util::hash_f32(transform.m22(), state);
+                util::hash_f32(transform.m23(), state);
             }
         }
         self.stops.hash(state);
@@ -71,7 +90,7 @@ impl Hash for ColorStop {
 impl Gradient {
     #[inline]
     pub fn linear(line: LineSegment2F) -> Gradient {
-        Gradient { line, radii: None, stops: SortedVector::new() }
+        Gradient { geometry: GradientGeometry::Linear(line), stops: Vec::new() }
     }
 
     #[inline]
@@ -81,12 +100,19 @@ impl Gradient {
 
     #[inline]
     pub fn radial<L>(line: L, radii: F32x2) -> Gradient where L: RadialGradientLine {
-        Gradient { line: line.to_line(), radii: Some(radii), stops: SortedVector::new() }
+        let transform = Transform2F::default();
+        Gradient {
+            geometry: GradientGeometry::Radial { line: line.to_line(), radii, transform },
+            stops: Vec::new(),
+        }
     }
 
     #[inline]
     pub fn add(&mut self, stop: ColorStop) {
-        self.stops.push(stop);
+        let index = self.stops.binary_search_by(|other| {
+            if other.offset <= stop.offset { Ordering::Less } else { Ordering::Greater }
+        }).unwrap_or_else(convert::identity);
+        self.stops.insert(index, stop);
     }
 
     /// A convenience method to add a color stop.
@@ -96,33 +122,13 @@ impl Gradient {
     }
 
     #[inline]
-    pub fn line(&self) -> LineSegment2F {
-        self.line
-    }
-
-    #[inline]
-    pub fn set_line(&mut self, line: LineSegment2F) {
-        self.line = line
-    }
-
-    #[inline]
-    pub fn radii(&self) -> Option<F32x2> {
-        self.radii
-    }
-
-    #[inline]
-    pub fn set_radii(&mut self, radii: Option<F32x2>) {
-        self.radii = radii
-    }
-
-    #[inline]
     pub fn stops(&self) -> &[ColorStop] {
-        &self.stops.array
+        &self.stops
     }
 
     #[inline]
     pub fn stops_mut(&mut self) -> &mut [ColorStop] {
-        &mut self.stops.array
+        &mut self.stops
     }
 
     pub fn sample(&self, mut t: f32) -> ColorU {
@@ -132,13 +138,14 @@ impl Gradient {
 
         t = geometry_util::clamp(t, 0.0, 1.0);
         let last_index = self.stops.len() - 1;
+
         let upper_index = self.stops.binary_search_by(|stop| {
-            stop.offset.partial_cmp(&t).unwrap_or(Ordering::Less)
+            if stop.offset < t || stop.offset == 0.0 { Ordering::Less } else { Ordering::Greater }
         }).unwrap_or_else(convert::identity).min(last_index);
         let lower_index = if upper_index > 0 { upper_index - 1 } else { upper_index };
 
-        let lower_stop = &self.stops.array[lower_index];
-        let upper_stop = &self.stops.array[upper_index];
+        let lower_stop = &self.stops[lower_index];
+        let upper_stop = &self.stops[upper_index];
 
         let denom = upper_stop.offset - lower_stop.offset;
         if denom == 0.0 {
@@ -149,6 +156,29 @@ impl Gradient {
                   .to_f32()
                   .lerp(upper_stop.color.to_f32(), (t - lower_stop.offset) / denom)
                   .to_u8()
+    }
+
+    #[inline]
+    pub fn is_opaque(&self) -> bool {
+        self.stops.iter().all(|stop| stop.color.is_opaque())
+    }
+
+    #[inline]
+    pub fn is_fully_transparent(&self) -> bool {
+        self.stops.iter().all(|stop| stop.color.is_fully_transparent())
+    }
+
+    pub fn apply_transform(&mut self, new_transform: Transform2F) {
+        if new_transform.is_identity() {
+            return;
+        }
+
+        match self.geometry {
+            GradientGeometry::Linear(ref mut line) => *line = new_transform * *line,
+            GradientGeometry::Radial { ref mut transform, .. } => {
+                *transform = new_transform * *transform
+            }
+        }
     }
 }
 
@@ -174,5 +204,39 @@ impl RadialGradientLine for Vector2F {
     #[inline]
     fn to_line(self) -> LineSegment2F {
         LineSegment2F::new(self, self)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::gradient::Gradient;
+    use pathfinder_color::ColorU;
+    use pathfinder_geometry::vector::Vector2F;
+
+    #[test]
+    fn stable_order() {
+        let mut grad = Gradient::linear_from_points(Vector2F::default(), Vector2F::default());
+        for i in 0..110 {
+            grad.add_color_stop(ColorU::new(i, 0, 0, 1), (i % 11) as f32 / 10.0);
+        }
+
+        // Check that it sorted stably
+        assert!(grad.stops.windows(2).all(|w| {
+            w[0].offset < w[1].offset || w[0].color.r < w[1].color.r
+        }));
+    }
+
+    #[test]
+    fn never_sample_zero_width() {
+        let mut grad = Gradient::linear_from_points(Vector2F::default(), Vector2F::default());
+        for i in 0..110 {
+            let zero_width = (i == 0) || (11 <= i && i < 99) || (i == 109);
+            grad.add_color_stop(ColorU::new(if zero_width { 255 } else { 0 }, 0, 0, 1), (i % 11) as f32 / 10.0);
+        }
+
+        for i in 0..11 {
+            let sample = grad.sample(i as f32 / 10.0);
+            assert!(sample.r == 0, "{} {}", i, sample.r);
+        }
     }
 }

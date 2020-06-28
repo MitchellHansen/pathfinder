@@ -19,75 +19,108 @@ extern crate objc;
 
 use block::{Block, ConcreteBlock, RcBlock};
 use byteorder::{NativeEndian, WriteBytesExt};
-use cocoa::foundation::{NSRange, NSUInteger};
+use cocoa::foundation::NSUInteger;
 use core_foundation::base::TCFType;
 use core_foundation::string::{CFString, CFStringRef};
+use dispatch::ffi::dispatch_queue_t;
+use dispatch::{Queue, QueueAttribute};
 use foreign_types::{ForeignType, ForeignTypeRef};
 use half::f16;
-use metal::{self, Argument, ArgumentEncoder, Buffer, CommandBuffer, CommandBufferRef};
-use metal::{CommandQueue, CompileOptions, CoreAnimationDrawable, CoreAnimationDrawableRef};
+use io_surface::IOSurfaceRef;
+use libc::size_t;
+use metal::{self, Argument, ArgumentEncoder, BlitCommandEncoder, Buffer, CommandBuffer};
+use metal::{CommandQueue, CompileOptions, ComputeCommandEncoder, ComputePipelineDescriptor};
+use metal::{ComputePipelineState, CoreAnimationDrawable, CoreAnimationDrawableRef};
 use metal::{CoreAnimationLayer, CoreAnimationLayerRef, DepthStencilDescriptor, Function, Library};
-use metal::{MTLArgument, MTLArgumentEncoder, MTLBlendFactor, MTLBlendOperation, MTLClearColor};
-use metal::{MTLColorWriteMask, MTLCompareFunction, MTLDataType, MTLDevice, MTLFunctionType};
-use metal::{MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRegion};
-use metal::{MTLRenderPipelineReflection, MTLRenderPipelineState, MTLResourceOptions};
-use metal::{MTLResourceUsage, MTLSamplerAddressMode, MTLSamplerMinMagFilter, MTLSize};
-use metal::{MTLStencilOperation, MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage};
-use metal::{MTLVertexFormat, MTLVertexStepFunction, MTLViewport, RenderCommandEncoder};
-use metal::{RenderCommandEncoderRef, RenderPassDescriptor, RenderPassDescriptorRef};
-use metal::{RenderPipelineColorAttachmentDescriptorRef, RenderPipelineDescriptor};
-use metal::{RenderPipelineReflection, RenderPipelineReflectionRef, RenderPipelineState};
-use metal::{SamplerDescriptor, SamplerState, StencilDescriptor, StructMemberRef, StructType};
-use metal::{StructTypeRef, TextureDescriptor, Texture, TextureRef, VertexAttribute};
-use metal::{VertexAttributeRef, VertexDescriptor, VertexDescriptorRef};
+use metal::{MTLArgument, MTLArgumentEncoder, MTLArgumentType, MTLBlendFactor, MTLBlendOperation};
+use metal::{MTLBlitOption, MTLClearColor, MTLColorWriteMask, MTLCompareFunction, MTLComputePipelineState};
+use metal::{MTLDataType, MTLDevice, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat};
+use metal::{MTLPrimitiveType, MTLRegion, MTLRenderPipelineReflection, MTLRenderPipelineState};
+use metal::{MTLResourceOptions, MTLResourceUsage, MTLSamplerAddressMode, MTLSamplerMinMagFilter};
+use metal::{MTLSize, MTLStencilOperation, MTLStorageMode, MTLStoreAction, MTLTextureType};
+use metal::{MTLTextureUsage, MTLVertexFormat, MTLVertexStepFunction, MTLViewport};
+use metal::{RenderCommandEncoder, RenderCommandEncoderRef, RenderPassDescriptor};
+use metal::{RenderPassDescriptorRef, RenderPipelineColorAttachmentDescriptorRef};
+use metal::{RenderPipelineDescriptor, RenderPipelineReflection, RenderPipelineReflectionRef};
+use metal::{RenderPipelineState, SamplerDescriptor, SamplerState, StencilDescriptor};
+use metal::{StructMemberRef, StructType, StructTypeRef, TextureDescriptor, Texture, TextureRef};
+use metal::{VertexAttribute, VertexAttributeRef, VertexDescriptor, VertexDescriptorRef};
 use objc::runtime::{Class, Object};
 use pathfinder_geometry::rect::RectI;
 use pathfinder_geometry::vector::{Vector2I, vec2i};
-use pathfinder_gpu::{BlendFactor, BlendOp, BufferData, BufferTarget, BufferUploadMode, DepthFunc};
-use pathfinder_gpu::{Device, Primitive, RenderState, RenderTarget, ShaderKind, StencilFunc};
-use pathfinder_gpu::{TextureData, TextureDataRef, TextureFormat, TextureSamplingFlags};
-use pathfinder_gpu::{UniformData, VertexAttrClass, VertexAttrDescriptor, VertexAttrType};
+use pathfinder_gpu::{BlendFactor, BlendOp, BufferData, BufferTarget, BufferUploadMode};
+use pathfinder_gpu::{ComputeDimensions, ComputeState, DepthFunc, Device, FeatureLevel};
+use pathfinder_gpu::{ImageAccess, Primitive, ProgramKind, RenderState, RenderTarget, ShaderKind};
+use pathfinder_gpu::{StencilFunc, TextureData, TextureDataRef, TextureFormat};
+use pathfinder_gpu::{TextureSamplingFlags, UniformData, VertexAttrClass};
+use pathfinder_gpu::{VertexAttrDescriptor, VertexAttrType};
 use pathfinder_resources::ResourceLoader;
 use pathfinder_simd::default::{F32x2, F32x4, I32x2};
 use std::cell::{Cell, RefCell};
+use std::convert::TryInto;
 use std::mem;
+use std::ops::Range;
 use std::ptr;
 use std::rc::Rc;
 use std::slice;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-const FIRST_VERTEX_BUFFER_INDEX: u64 = 1;
+const FIRST_VERTEX_BUFFER_INDEX: u64 = 16;
 
 pub struct MetalDevice {
     device: metal::Device,
-    layer: CoreAnimationLayer,
-    drawable: CoreAnimationDrawable,
+    main_color_texture: Texture,
     main_depth_stencil_texture: Texture,
     command_queue: CommandQueue,
     command_buffers: RefCell<Vec<CommandBuffer>>,
     samplers: Vec<SamplerState>,
-    shared_event: SharedEvent,
+    #[allow(dead_code)]
+    dispatch_queue: Queue,
+    timer_query_shared_event: SharedEvent,
+    buffer_upload_shared_event: SharedEvent,
     shared_event_listener: SharedEventListener,
+    compute_fence: RefCell<Option<Fence>>,
     next_timer_query_event_value: Cell<u64>,
+    next_buffer_upload_event_value: Cell<u64>,
+    buffer_upload_event_data: Arc<BufferUploadEventData>,
 }
 
-pub struct MetalProgram {
-    vertex: MetalShader,
-    fragment: MetalShader,
+pub enum MetalProgram {
+    Raster(MetalRasterProgram),
+    Compute(MetalComputeProgram),
+}
+
+pub struct MetalRasterProgram {
+    vertex_shader: MetalShader,
+    fragment_shader: MetalShader,
+}
+
+pub struct MetalComputeProgram {
+    shader: MetalShader,
+    local_size: MTLSize,
 }
 
 #[derive(Clone)]
 pub struct MetalBuffer {
-    buffer: Rc<RefCell<Option<Buffer>>>,
+    allocations: Rc<RefCell<BufferAllocations>>,
+    mode: BufferUploadMode,
+}
+
+struct BufferAllocations {
+    private: Option<Buffer>,
+    shared: Option<StagingBuffer>,
+    byte_size: u64,
+}
+
+struct StagingBuffer {
+    buffer: Buffer,
+    event_value: u64,
 }
 
 impl MetalDevice {
     #[inline]
-    pub fn new(layer: &CoreAnimationLayerRef) -> MetalDevice {
-        let layer = layer.retain();
-        let device = layer.device();
-        let drawable = layer.next_drawable().unwrap().retain();
+    pub unsafe fn new<T>(device: metal::Device, texture: T) -> MetalDevice where T: IntoTexture {
         let command_queue = device.new_command_queue();
 
         let samplers = (0..16).map(|sampling_flags_value| {
@@ -122,32 +155,51 @@ impl MetalDevice {
             device.new_sampler(&sampler_descriptor)
         }).collect();
 
-        let main_color_texture = drawable.texture();
-        let framebuffer_size = vec2i(main_color_texture.width() as i32,
-                                     main_color_texture.height() as i32);
+        let texture = texture.into_texture(&device);
+        let framebuffer_size = vec2i(texture.width() as i32, texture.height() as i32);
         let main_depth_stencil_texture = device.create_depth_stencil_texture(framebuffer_size);
 
-        let shared_event = device.new_shared_event();
+        let timer_query_shared_event = device.new_shared_event();
+        let buffer_upload_shared_event = device.new_shared_event();
+
+        let dispatch_queue = Queue::create("graphics.pathfinder.queue",
+                                           QueueAttribute::Concurrent);
+        let shared_event_listener = SharedEventListener::new_from_dispatch_queue(&dispatch_queue);
+
+        let buffer_upload_event_data = Arc::new(BufferUploadEventData {
+            mutex: Mutex::new(0),
+            cond: Condvar::new(),
+        });
 
         MetalDevice {
             device,
-            layer,
-            drawable,
+            main_color_texture: texture,
             main_depth_stencil_texture,
             command_queue,
             command_buffers: RefCell::new(vec![]),
             samplers,
-            shared_event,
-            shared_event_listener: SharedEventListener::new(),
+            dispatch_queue,
+            timer_query_shared_event,
+            buffer_upload_shared_event,
+            shared_event_listener,
+            compute_fence: RefCell::new(None),
             next_timer_query_event_value: Cell::new(1),
+            next_buffer_upload_event_value: Cell::new(1),
+            buffer_upload_event_data,
         }
     }
 
-    pub fn present_drawable(&mut self) {
-        self.begin_commands();
-        self.command_buffers.borrow_mut().last().unwrap().present_drawable(&self.drawable);
-        self.end_commands();
-        self.drawable = self.layer.next_drawable().unwrap().retain();
+    #[inline]
+    pub fn swap_texture<T>(&mut self, new_texture: T) -> Texture where T: IntoTexture {
+        unsafe {
+            let new_texture = new_texture.into_texture(&self.device);
+            mem::replace(&mut self.main_color_texture, new_texture)
+        }
+    }
+
+    #[inline]
+    pub fn metal_device(&self) -> metal::Device {
+        self.device.clone()
     }
 }
 
@@ -157,34 +209,39 @@ pub struct MetalShader {
     #[allow(dead_code)]
     library: Library,
     function: Function,
-    uniforms: RefCell<ShaderUniforms>,
-}
-
-enum ShaderUniforms {
-    Unknown,
-    NoUniforms,
-    Uniforms { encoder: ArgumentEncoder, struct_type: StructType }
+    #[allow(dead_code)]
+    name: String,
+    arguments: RefCell<Option<ArgumentArray>>,
 }
 
 pub struct MetalTexture {
-    texture: Texture,
+    private_texture: Texture,
+    shared_buffer: RefCell<Option<Buffer>>,
     sampling_flags: Cell<TextureSamplingFlags>,
-    dirty: Cell<bool>,
 }
 
 #[derive(Clone)]
 pub struct MetalTextureDataReceiver(Arc<MetalTextureDataReceiverInfo>);
 
 struct MetalTextureDataReceiverInfo {
-    mutex: Mutex<MetalTextureDataReceiverState>,
+    mutex: Mutex<MetalDataReceiverState<TextureData>>,
     cond: Condvar,
     texture: Texture,
     viewport: RectI,
 }
 
-enum MetalTextureDataReceiverState {
+#[derive(Clone)]
+pub struct MetalBufferDataReceiver(Arc<MetalBufferDataReceiverInfo>);
+
+struct MetalBufferDataReceiverInfo {
+    mutex: Mutex<MetalDataReceiverState<Vec<u8>>>,
+    cond: Condvar,
+    staging_buffer: Buffer,
+}
+
+enum MetalDataReceiverState<T> {
     Pending,
-    Downloaded(TextureData),
+    Downloaded(T),
     Finished,
 }
 
@@ -194,12 +251,14 @@ pub struct MetalTimerQuery(Arc<MetalTimerQueryInfo>);
 struct MetalTimerQueryInfo {
     mutex: Mutex<MetalTimerQueryData>,
     cond: Condvar,
-    event_value: u64,
 }
 
 struct MetalTimerQueryData {
     start_time: Option<Instant>,
     end_time: Option<Instant>,
+    start_block: Option<RcBlock<(*mut Object, u64), ()>>,
+    end_block: Option<RcBlock<(*mut Object, u64), ()>>,
+    start_event_value: u64,
 }
 
 #[derive(Clone)]
@@ -208,16 +267,63 @@ pub struct MetalUniform {
     name: String,
 }
 
+#[derive(Clone)]
+pub struct MetalTextureParameter {
+    indices: RefCell<Option<MetalTextureIndices>>,
+    name: String,
+}
+
+#[derive(Clone)]
+pub struct MetalImageParameter {
+    indices: RefCell<Option<MetalImageIndices>>,
+    name: String,
+}
+
+#[derive(Clone)]
+pub struct MetalStorageBuffer {
+    indices: RefCell<Option<MetalStorageBufferIndices>>,
+    name: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MetalUniformIndices(ProgramKind<Option<MetalUniformIndex>>);
+
+#[derive(Clone, Copy, Debug)]
+pub struct MetalUniformIndex(u64);
+
 #[derive(Clone, Copy)]
-pub struct MetalUniformIndices {
-    vertex: Option<MetalUniformIndex>,
-    fragment: Option<MetalUniformIndex>,
+pub struct MetalTextureIndices(ProgramKind<Option<MetalTextureIndex>>);
+
+#[derive(Clone, Copy, Debug)]
+pub struct MetalTextureIndex {
+    main: u64,
+    sampler: u64,
 }
 
 #[derive(Clone, Copy)]
-pub struct MetalUniformIndex {
-    main: u64,
-    sampler: Option<u64>,
+pub struct MetalImageIndices(ProgramKind<Option<MetalImageIndex>>);
+
+#[derive(Clone, Copy, Debug)]
+pub struct MetalImageIndex(u64);
+
+#[derive(Clone, Copy)]
+pub struct MetalStorageBufferIndices(ProgramKind<Option<MetalStorageBufferIndex>>);
+
+#[derive(Clone, Copy, Debug)]
+pub struct MetalStorageBufferIndex(u64);
+
+#[derive(Clone)]
+pub struct MetalFence(Arc<MetalFenceInfo>);
+
+struct MetalFenceInfo {
+    mutex: Mutex<MetalFenceStatus>,
+    cond: Condvar,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum MetalFenceStatus {
+    Pending,
+    Resolved,
 }
 
 pub struct MetalVertexArray {
@@ -228,35 +334,44 @@ pub struct MetalVertexArray {
 
 impl Device for MetalDevice {
     type Buffer = MetalBuffer;
+    type BufferDataReceiver = MetalBufferDataReceiver;
+    type Fence = MetalFence;
     type Framebuffer = MetalFramebuffer;
+    type ImageParameter = MetalImageParameter;
     type Program = MetalProgram;
     type Shader = MetalShader;
+    type StorageBuffer = MetalStorageBuffer;
     type Texture = MetalTexture;
     type TextureDataReceiver = MetalTextureDataReceiver;
+    type TextureParameter = MetalTextureParameter;
     type TimerQuery = MetalTimerQuery;
     type Uniform = MetalUniform;
     type VertexArray = MetalVertexArray;
     type VertexAttr = VertexAttribute;
 
+    #[inline]
+    fn backend_name(&self) -> &'static str {
+        "Metal"
+    }
+
+    #[inline]
+    fn device_name(&self) -> String {
+        self.device.name().to_owned()
+    }
+
+    #[inline]
+    fn feature_level(&self) -> FeatureLevel {
+        FeatureLevel::D3D11
+    }
+
     // TODO: Add texture usage hint.
     fn create_texture(&self, format: TextureFormat, size: Vector2I) -> MetalTexture {
-        let descriptor = TextureDescriptor::new();
-        descriptor.set_texture_type(MTLTextureType::D2);
-        match format {
-            TextureFormat::R8 => descriptor.set_pixel_format(MTLPixelFormat::R8Unorm),
-            TextureFormat::R16F => descriptor.set_pixel_format(MTLPixelFormat::R16Float),
-            TextureFormat::RGBA8 => descriptor.set_pixel_format(MTLPixelFormat::RGBA8Unorm),
-            TextureFormat::RGBA16F => descriptor.set_pixel_format(MTLPixelFormat::RGBA16Float),
-            TextureFormat::RGBA32F => descriptor.set_pixel_format(MTLPixelFormat::RGBA32Float),
-        }
-        descriptor.set_width(size.x() as u64);
-        descriptor.set_height(size.y() as u64);
-        descriptor.set_storage_mode(MTLStorageMode::Managed);
-        descriptor.set_usage(MTLTextureUsage::Unknown);
+        let descriptor = create_texture_descriptor(format, size);
+        descriptor.set_storage_mode(MTLStorageMode::Private);
         MetalTexture {
-            texture: self.device.new_texture(&descriptor),
+            private_texture: self.device.new_texture(&descriptor),
+            shared_buffer: RefCell::new(None),
             sampling_flags: Cell::new(TextureSamplingFlags::empty()),
-            dirty: Cell::new(false),
         }
     }
 
@@ -267,14 +382,19 @@ impl Device for MetalDevice {
         texture
     }
 
-    fn create_shader_from_source(&self, _: &str, source: &[u8], _: ShaderKind) -> MetalShader {
+    fn create_shader_from_source(&self, name: &str, source: &[u8], _: ShaderKind) -> MetalShader {
         let source = String::from_utf8(source.to_vec()).expect("Source wasn't valid UTF-8!");
 
         let compile_options = CompileOptions::new();
         let library = self.device.new_library_with_source(&source, &compile_options).unwrap();
         let function = library.get_function("main0", None).unwrap();
 
-        MetalShader { library, function, uniforms: RefCell::new(ShaderUniforms::Unknown) }
+        MetalShader {
+            library,
+            function,
+            name: name.to_owned(),
+            arguments: RefCell::new(None),
+        }
     }
 
     fn create_vertex_array(&self) -> MetalVertexArray {
@@ -296,21 +416,47 @@ impl Device for MetalDevice {
             BufferTarget::Index => {
                 *vertex_array.index_buffer.borrow_mut() = Some((*buffer).clone())
             }
+            _ => panic!("Buffers bound to vertex arrays must be vertex or index buffers!"),
         }
     }
 
     fn create_program_from_shaders(&self,
                                    _: &dyn ResourceLoader,
                                    _: &str,
-                                   vertex_shader: MetalShader,
-                                   fragment_shader: MetalShader)
+                                   shaders: ProgramKind<MetalShader>)
                                    -> MetalProgram {
-        MetalProgram { vertex: vertex_shader, fragment: fragment_shader }
+        match shaders {
+            ProgramKind::Raster { vertex: vertex_shader, fragment: fragment_shader } => {
+                MetalProgram::Raster(MetalRasterProgram { vertex_shader, fragment_shader })
+            }
+            ProgramKind::Compute(shader) => {
+                let local_size = MTLSize { width: 0, height: 0, depth: 0 };
+                MetalProgram::Compute(MetalComputeProgram { shader, local_size })
+            }
+        }
+    }
+
+    // FIXME(pcwalton): Is there a way to introspect the shader to find `gl_WorkGroupSize`? That
+    // would obviate the need for this function.
+    fn set_compute_program_local_size(&self,
+                                      program: &mut MetalProgram,
+                                      new_local_size: ComputeDimensions) {
+        match *program {
+            MetalProgram::Compute(MetalComputeProgram { ref mut local_size, .. }) => {
+                *local_size = new_local_size.to_metal_size()
+            }
+            _ => panic!("Program was not a compute program!"),
+        }
     }
 
     fn get_vertex_attr(&self, program: &MetalProgram, name: &str) -> Option<VertexAttribute> {
         // TODO(pcwalton): Cache the function?
-        let attributes = program.vertex.function.real_vertex_attributes();
+        let attributes = match *program {
+            MetalProgram::Raster(MetalRasterProgram { ref vertex_shader, .. }) => {
+                vertex_shader.function.real_vertex_attributes()
+            }
+            _ => unreachable!(),
+        };
         for attribute_index in 0..attributes.len() {
             let attribute = attributes.object_at(attribute_index);
             let this_name = attribute.name().as_bytes();
@@ -323,6 +469,18 @@ impl Device for MetalDevice {
 
     fn get_uniform(&self, _: &Self::Program, name: &str) -> MetalUniform {
         MetalUniform { indices: RefCell::new(None), name: name.to_owned() }
+    }
+
+    fn get_texture_parameter(&self, _: &Self::Program, name: &str) -> MetalTextureParameter {
+        MetalTextureParameter { indices: RefCell::new(None), name: name.to_owned() }
+    }
+
+    fn get_image_parameter(&self, _: &Self::Program, name: &str) -> MetalImageParameter {
+        MetalImageParameter { indices: RefCell::new(None), name: name.to_owned() }
+    }
+
+    fn get_storage_buffer(&self, _: &Self::Program, name: &str, _: u32) -> MetalStorageBuffer {
+        MetalStorageBuffer { indices: RefCell::new(None), name: name.to_owned() }
     }
 
     fn configure_vertex_attr(&self,
@@ -397,6 +555,7 @@ impl Device for MetalDevice {
                 MTLVertexFormat::UCharNormalized
             }
             (VertexAttrClass::Int, VertexAttrType::I16, 1) => MTLVertexFormat::Short,
+            (VertexAttrClass::Int, VertexAttrType::I32, 1) => MTLVertexFormat::Int,
             (VertexAttrClass::Int, VertexAttrType::U16, 1) => MTLVertexFormat::UShort,
             (VertexAttrClass::FloatNorm, VertexAttrType::U16, 1) => {
                 MTLVertexFormat::UShortNormalized
@@ -433,35 +592,113 @@ impl Device for MetalDevice {
         MetalFramebuffer(texture)
     }
 
-    fn create_buffer(&self) -> MetalBuffer {
-        MetalBuffer { buffer: Rc::new(RefCell::new(None)) }
+    fn create_buffer(&self, mode: BufferUploadMode) -> MetalBuffer {
+        MetalBuffer {
+            allocations: Rc::new(RefCell::new(BufferAllocations {
+                private: None,
+                shared: None,
+                byte_size: 0,
+            })),
+            mode,
+        }
     }
 
     fn allocate_buffer<T>(&self,
                           buffer: &MetalBuffer,
                           data: BufferData<T>,
-                          _: BufferTarget,
-                          mode: BufferUploadMode) {
-        let mut options = match mode {
-            BufferUploadMode::Static => MTLResourceOptions::CPUCacheModeWriteCombined,
-            BufferUploadMode::Dynamic => MTLResourceOptions::CPUCacheModeDefaultCache,
+                          target: BufferTarget) {
+        let options = buffer.mode.to_metal_resource_options();
+        let length = match data {
+            BufferData::Uninitialized(size) => size,
+            BufferData::Memory(slice) => slice.len(),
         };
-        options |= MTLResourceOptions::StorageModeManaged;
+        let byte_size = (length * mem::size_of::<T>()) as u64;
+        let new_buffer = self.device.new_buffer(byte_size, options);
+
+        *buffer.allocations.borrow_mut() = BufferAllocations {
+             private: Some(new_buffer),
+             shared: None,
+             byte_size,
+        };
 
         match data {
-            BufferData::Uninitialized(size) => {
-                let size = (size * mem::size_of::<T>()) as u64;
-                let new_buffer = self.device.new_buffer(size, options);
-                *buffer.buffer.borrow_mut() = Some(new_buffer);
-            }
-            BufferData::Memory(slice) => {
-                let size = (slice.len() * mem::size_of::<T>()) as u64;
-                let new_buffer = self.device.new_buffer_with_data(slice.as_ptr() as *const _,
-                                                                  size,
-                                                                  options);
-                *buffer.buffer.borrow_mut() = Some(new_buffer);
+            BufferData::Uninitialized(_) => {}
+            BufferData::Memory(slice) => self.upload_to_buffer(buffer, 0, slice, target),
+        }
+    }
+
+    fn upload_to_buffer<T>(&self,
+                           dest_buffer: &MetalBuffer,
+                           start: usize,
+                           data: &[T],
+                           _: BufferTarget) {
+        if data.is_empty() {
+            return;
+        }
+
+        let mut dest_allocations = dest_buffer.allocations.borrow_mut();
+        let dest_allocations = &mut *dest_allocations;
+        let dest_private_buffer = dest_allocations.private.as_mut().unwrap();
+
+        let byte_start = (start * mem::size_of::<T>()) as u64;
+        let byte_size = (data.len() * mem::size_of::<T>()) as u64;
+
+        if dest_allocations.shared.is_none() {
+            let resource_options = MTLResourceOptions::CPUCacheModeWriteCombined |
+                MTLResourceOptions::StorageModeShared;
+            dest_allocations.shared = Some(StagingBuffer {
+                buffer: self.device.new_buffer(dest_allocations.byte_size, resource_options),
+                event_value: 0,
+            });
+        }
+
+        let staging_buffer = dest_allocations.shared.as_mut().unwrap();
+        if staging_buffer.event_value != 0 {
+            let mut mutex = self.buffer_upload_event_data.mutex.lock().unwrap();
+            while *mutex < staging_buffer.event_value {
+                mutex = self.buffer_upload_event_data.cond.wait(mutex).unwrap();
             }
         }
+
+        unsafe {
+            ptr::copy_nonoverlapping(
+                data.as_ptr() as *const u8,
+                (staging_buffer.buffer.contents() as *mut u8).offset(byte_start as isize),
+                byte_size as usize)
+        }
+
+        staging_buffer.event_value = self.next_buffer_upload_event_value.get();
+        self.next_buffer_upload_event_value.set(staging_buffer.event_value + 1);
+
+        {
+            let command_buffers = self.command_buffers.borrow();
+            let command_buffer = command_buffers.last().unwrap();
+            let blit_command_encoder = command_buffer.real_new_blit_command_encoder();
+            blit_command_encoder.copy_from_buffer(&staging_buffer.buffer,
+                                                byte_start,
+                                                &dest_private_buffer,
+                                                byte_start,
+                                                byte_size);
+            blit_command_encoder.end_encoding();
+
+            command_buffer.encode_signal_event(&self.buffer_upload_shared_event,
+                                               staging_buffer.event_value);
+
+            let buffer_upload_event_data = self.buffer_upload_event_data.clone();
+            let event_value = staging_buffer.event_value;
+            let listener_block = ConcreteBlock::new(move |_, _| {
+                let mut mutex = buffer_upload_event_data.mutex.lock().unwrap();
+                *mutex = (*mutex).max(event_value);
+                buffer_upload_event_data.cond.notify_all();
+            });
+            self.buffer_upload_shared_event.notify_listener_at_value(&self.shared_event_listener,   
+                                                                     staging_buffer.event_value,
+                                                                     listener_block.copy());
+        }
+
+        // Flush to avoid deadlock.
+        self.end_commands();
+        self.begin_commands();
     }
 
     #[inline]
@@ -475,7 +712,7 @@ impl Device for MetalDevice {
     }
 
     fn texture_format(&self, texture: &MetalTexture) -> TextureFormat {
-        match texture.texture.pixel_format() {
+        match texture.private_texture.pixel_format() {
             MTLPixelFormat::R8Unorm => TextureFormat::R8,
             MTLPixelFormat::R16Float => TextureFormat::R16F,
             MTLPixelFormat::RGBA8Unorm => TextureFormat::RGBA8,
@@ -486,34 +723,70 @@ impl Device for MetalDevice {
     }
 
     fn texture_size(&self, texture: &MetalTexture) -> Vector2I {
-        vec2i(texture.texture.width() as i32, texture.texture.height() as i32)
+        vec2i(texture.private_texture.width() as i32, texture.private_texture.height() as i32)
     }
 
     fn set_texture_sampling_mode(&self, texture: &MetalTexture, flags: TextureSamplingFlags) {
         texture.sampling_flags.set(flags)
     }
 
-    fn upload_to_texture(&self, texture: &MetalTexture, rect: RectI, data: TextureDataRef) {
-        let texture_size = self.texture_size(texture);
-        assert!(rect.size().x() >= 0);
-        assert!(rect.size().y() >= 0);
-        assert!(rect.max_x() <= texture_size.x());
-        assert!(rect.max_y() <= texture_size.y());
+    fn upload_to_texture(&self, dest_texture: &MetalTexture, rect: RectI, data: TextureDataRef) {
+        let command_buffers = self.command_buffers.borrow();
+        let command_buffer = command_buffers.last().expect("Must call `begin_commands()` first!");
 
-        let format = self.texture_format(&texture.texture).expect("Unexpected texture format!");
-        let data_ptr = data.check_and_extract_data_ptr(rect.size(), format);
+        let texture_size = self.texture_size(dest_texture);
+        let texture_format = self.texture_format(&dest_texture.private_texture)
+                                 .expect("Unexpected texture format!");
+        let bytes_per_pixel = texture_format.bytes_per_pixel() as u64;
+        let texture_byte_size = texture_size.area() as u64 * bytes_per_pixel;
 
-        let origin = MTLOrigin { x: rect.origin().x() as u64, y: rect.origin().y() as u64, z: 0 };
-        let size = MTLSize {
-            width: rect.size().x() as u64,
-            height: rect.size().y() as u64,
+        let mut src_shared_buffer = dest_texture.shared_buffer.borrow_mut();
+        if src_shared_buffer.is_none() {
+            let resource_options = MTLResourceOptions::CPUCacheModeWriteCombined |
+                MTLResourceOptions::StorageModeShared;
+            *src_shared_buffer = Some(self.device.new_buffer(texture_byte_size, resource_options));
+        }
+
+        // TODO(pcwalton): Wait if necessary...
+        let src_shared_buffer = src_shared_buffer.as_ref().unwrap();
+        let texture_data_ptr =
+            data.check_and_extract_data_ptr(rect.size(), texture_format) as *const u8;
+        let src_stride = rect.width() as u64 * bytes_per_pixel;
+        let dest_stride = texture_size.x() as u64 * bytes_per_pixel;
+        unsafe {
+            let dest_contents = src_shared_buffer.contents() as *mut u8;
+            for src_y in 0..rect.height() {
+                let dest_y = src_y + rect.origin_y();
+                let src_offset = src_y as isize * src_stride as isize;
+                let dest_offset = dest_y as isize * dest_stride as isize +
+                    rect.origin_x() as isize * bytes_per_pixel as isize;
+                ptr::copy_nonoverlapping(texture_data_ptr.offset(src_offset),
+                                         dest_contents.offset(dest_offset),
+                                         src_stride as usize);
+            }
+        }
+
+        let src_size = MTLSize {
+            width: rect.width() as u64,
+            height: rect.height() as u64,
             depth: 1,
         };
-        let region = MTLRegion { origin, size };
-        let stride = format.bytes_per_pixel() as u64 * size.width;
-        texture.texture.replace_region(region, 0, stride, data_ptr);
+        let dest_origin = MTLOrigin { x: rect.origin_x() as u64, y: rect.origin_y() as u64, z: 0 };
+        let dest_byte_offset = rect.origin_y() as u64 * src_stride as u64 +
+            rect.origin_x() as u64 * bytes_per_pixel as u64;
 
-        texture.dirty.set(true);
+        let blit_command_encoder = command_buffer.real_new_blit_command_encoder();
+        blit_command_encoder.copy_from_buffer_to_texture(&src_shared_buffer,
+                                                         dest_byte_offset,
+                                                         dest_stride,
+                                                         0,
+                                                         src_size,
+                                                         &dest_texture.private_texture,
+                                                         0,
+                                                         0,
+                                                         dest_origin,
+                                                         MTLBlitOption::empty());
+        blit_command_encoder.end_encoding();
     }
 
     fn read_pixels(&self, target: &RenderTarget<MetalDevice>, viewport: RectI)
@@ -521,7 +794,7 @@ impl Device for MetalDevice {
         let texture = self.render_target_color_texture(target);
         let texture_data_receiver =
             MetalTextureDataReceiver(Arc::new(MetalTextureDataReceiverInfo {
-                mutex: Mutex::new(MetalTextureDataReceiverState::Pending),
+                mutex: Mutex::new(MetalDataReceiverState::Pending),
                 cond: Condvar::new(),
                 texture,
                 viewport,
@@ -533,11 +806,81 @@ impl Device for MetalDevice {
         });
 
         self.synchronize_texture(&texture_data_receiver.0.texture, block.copy());
+
+        self.end_commands();
+        self.begin_commands();
+
         texture_data_receiver
     }
 
+    fn read_buffer(&self, src_buffer: &MetalBuffer, _: BufferTarget, range: Range<usize>)
+                   -> MetalBufferDataReceiver {
+        let buffer_data_receiver;
+        {
+            let command_buffers = self.command_buffers.borrow();
+            let command_buffer = command_buffers.last().unwrap();
+
+            let mut src_allocations = src_buffer.allocations.borrow_mut();
+            let src_allocations = &mut *src_allocations;
+            let src_private_buffer = src_allocations.private
+                                                    .as_ref()
+                                                    .expect("Private buffer not allocated!");
+
+            if src_allocations.shared.is_none() {
+                let resource_options = MTLResourceOptions::CPUCacheModeWriteCombined |
+                    MTLResourceOptions::StorageModeShared;
+                src_allocations.shared = Some(StagingBuffer {
+                    buffer: self.device.new_buffer(src_allocations.byte_size, resource_options),
+                    event_value: 0,
+                });
+            }
+
+            let staging_buffer = src_allocations.shared.as_ref().unwrap();
+            let byte_size = (range.end - range.start) as u64;
+            let blit_command_encoder = command_buffer.real_new_blit_command_encoder();
+            blit_command_encoder.copy_from_buffer(src_private_buffer,
+                                                  0,
+                                                  &staging_buffer.buffer,
+                                                  range.start as u64,
+                                                  byte_size);
+
+            buffer_data_receiver = MetalBufferDataReceiver(Arc::new(MetalBufferDataReceiverInfo {
+                mutex: Mutex::new(MetalDataReceiverState::Pending),
+                cond: Condvar::new(),
+                staging_buffer: staging_buffer.buffer.clone(),
+            }));
+
+            blit_command_encoder.end_encoding();
+
+            let buffer_data_receiver_for_block = buffer_data_receiver.clone();
+            let block = ConcreteBlock::new(move |_| buffer_data_receiver_for_block.download());
+            command_buffer.add_completed_handler(block.copy());
+        }
+
+        self.end_commands();
+        self.begin_commands();
+
+        buffer_data_receiver
+    }
+
+    fn try_recv_buffer(&self, buffer_data_receiver: &MetalBufferDataReceiver) -> Option<Vec<u8>> {
+        try_recv_data_with_guard(&mut buffer_data_receiver.0.mutex.lock().unwrap())
+    }
+
+    fn recv_buffer(&self, buffer_data_receiver: &MetalBufferDataReceiver) -> Vec<u8> {
+        let mut guard = buffer_data_receiver.0.mutex.lock().unwrap();
+
+        loop {
+            let buffer_data = try_recv_data_with_guard(&mut guard);
+            if let Some(buffer_data) = buffer_data {
+                return buffer_data
+            }
+            guard = buffer_data_receiver.0.cond.wait(guard).unwrap();
+        }
+    }
+
     fn begin_commands(&self) {
-        self.command_buffers.borrow_mut().push(self.command_queue.new_command_buffer().retain());
+        self.command_buffers.borrow_mut().push(self.command_queue.new_command_buffer_retained())
     }
 
     fn end_commands(&self) {
@@ -561,8 +904,8 @@ impl Device for MetalDevice {
                                        .index_buffer
                                        .borrow();
         let index_buffer = index_buffer.as_ref().expect("No index buffer bound to VAO!");
-        let index_buffer = index_buffer.buffer.borrow();
-        let index_buffer = index_buffer.as_ref().expect("Index buffer not allocated!");
+        let index_buffer = index_buffer.allocations.borrow();
+        let index_buffer = index_buffer.private.as_ref().expect("Index buffer not allocated!");
         encoder.draw_indexed_primitives(primitive, index_count, index_type, index_buffer, 0);
         encoder.end_encoding();
     }
@@ -573,13 +916,15 @@ impl Device for MetalDevice {
                                render_state: &RenderState<MetalDevice>) {
         let encoder = self.prepare_to_draw(render_state);
         let primitive = render_state.primitive.to_metal_primitive();
+
         let index_type = MTLIndexType::UInt32;
         let index_buffer = render_state.vertex_array
                                        .index_buffer
                                        .borrow();
         let index_buffer = index_buffer.as_ref().expect("No index buffer bound to VAO!");
-        let index_buffer = index_buffer.buffer.borrow();
-        let index_buffer = index_buffer.as_ref().expect("Index buffer not allocated!");
+        let index_buffer = index_buffer.allocations.borrow();
+        let index_buffer = index_buffer.private.as_ref().expect("Index buffer not allocated!");
+
         encoder.draw_indexed_primitives_instanced(primitive,
                                                   index_count as u64,
                                                   index_type,
@@ -589,55 +934,124 @@ impl Device for MetalDevice {
         encoder.end_encoding();
     }
 
-    fn create_timer_query(&self) -> MetalTimerQuery {
-        let event_value = self.next_timer_query_event_value.get();
-        self.next_timer_query_event_value.set(event_value + 2);
+    fn dispatch_compute(&self,
+                        size: ComputeDimensions,
+                        compute_state: &ComputeState<MetalDevice>) {
+        let command_buffers = self.command_buffers.borrow();
+        let command_buffer = command_buffers.last().unwrap();
 
+        let encoder = command_buffer.real_new_compute_command_encoder();
+
+        let program = match compute_state.program {
+            MetalProgram::Compute(ref compute_program) => compute_program,
+            _ => panic!("Compute render command must use a compute program!"),
+        };
+
+        let compute_pipeline_descriptor = ComputePipelineDescriptor::new();
+        compute_pipeline_descriptor.set_compute_function(Some(&program.shader.function));
+
+        let compute_pipeline_state = unsafe {
+            if program.shader.arguments.borrow().is_none() {
+                // FIXME(pcwalton): Factor these raw Objective-C method calls out into a trait.
+                let mut reflection: *mut Object = ptr::null_mut();
+                let reflection_options = MTLPipelineOption::ArgumentInfo |
+                    MTLPipelineOption::BufferTypeInfo;
+                let mut error: *mut Object = ptr::null_mut();
+                let raw_compute_pipeline_state: *mut MTLComputePipelineState = msg_send![
+                    self.device.as_ptr(),
+                    newComputePipelineStateWithDescriptor:compute_pipeline_descriptor.as_ptr()
+                                                options:reflection_options
+                                             reflection:&mut reflection
+                                                  error:&mut error];
+                let compute_pipeline_state =
+                    ComputePipelineState::from_ptr(raw_compute_pipeline_state);
+                *program.shader.arguments.borrow_mut() =
+                    Some(ArgumentArray::from_ptr(msg_send![reflection, arguments]));
+                compute_pipeline_state
+            } else {
+                self.device
+                    .new_compute_pipeline_state(&compute_pipeline_descriptor)
+                    .expect("Failed to create compute pipeline state!")
+            }
+        };
+
+        self.set_compute_uniforms(&encoder, &compute_state);
+        encoder.set_compute_pipeline_state(&compute_pipeline_state);
+
+        let local_size = match compute_state.program {
+            MetalProgram::Compute(MetalComputeProgram { ref local_size, .. }) => *local_size,
+            _ => panic!("Program was not a compute program!"),
+        };
+
+        encoder.dispatch_thread_groups(size.to_metal_size(), local_size);
+
+        let fence = self.device.new_fence();
+        encoder.update_fence(&fence);
+        *self.compute_fence.borrow_mut() = Some(fence);
+
+        encoder.end_encoding();
+    }
+
+    fn create_timer_query(&self) -> MetalTimerQuery {
         let query = MetalTimerQuery(Arc::new(MetalTimerQueryInfo {
-            event_value,
-            mutex: Mutex::new(MetalTimerQueryData { start_time: None, end_time: None }),
+            mutex: Mutex::new(MetalTimerQueryData {
+                start_time: None,
+                end_time: None,
+                start_block: None,
+                end_block: None,
+                start_event_value: 0,
+            }),
             cond: Condvar::new(),
         }));
 
-        let captured_query = query.clone();
-        let start_block = ConcreteBlock::new(move |_: *mut Object, _: u64| {
-            let mut guard = captured_query.0.mutex.lock().unwrap();
-            guard.start_time = Some(Instant::now());
-        });
-        let captured_query = query.clone();
-        let end_block = ConcreteBlock::new(move |_: *mut Object, _: u64| {
-            let mut guard = captured_query.0.mutex.lock().unwrap();
-            guard.end_time = Some(Instant::now());
-            captured_query.0.cond.notify_all();
-        });
-        self.shared_event.notify_listener_at_value(&self.shared_event_listener,
-                                                   event_value,
-                                                   start_block.copy());
-        self.shared_event.notify_listener_at_value(&self.shared_event_listener,
-                                                   event_value + 1,
-                                                   end_block.copy());
+        let captured_query = Arc::downgrade(&query.0);
+        query.0.mutex.lock().unwrap().start_block = Some(ConcreteBlock::new(move |_: *mut Object,
+                                                                                  _: u64| {
+            let start_time = Instant::now();
+            let query = captured_query.upgrade().unwrap();
+            let mut guard = query.mutex.lock().unwrap();
+            guard.start_time = Some(start_time);
+        }).copy());
+        let captured_query = Arc::downgrade(&query.0);
+        query.0.mutex.lock().unwrap().end_block = Some(ConcreteBlock::new(move |_: *mut Object,
+                                                                                _: u64| {
+            let end_time = Instant::now();
+            let query = captured_query.upgrade().unwrap();
+            let mut guard = query.mutex.lock().unwrap();
+            guard.end_time = Some(end_time);
+            query.cond.notify_all();
+        }).copy());
 
         query
     }
 
     fn begin_timer_query(&self, query: &MetalTimerQuery) {
-        /*
+        let start_event_value = self.next_timer_query_event_value.get();
+        self.next_timer_query_event_value.set(start_event_value + 2);
+        let mut guard = query.0.mutex.lock().unwrap();
+        guard.start_event_value = start_event_value;
+        self.timer_query_shared_event
+            .notify_listener_at_value(&self.shared_event_listener,
+                                      start_event_value,
+                                      (*guard.start_block.as_ref().unwrap()).clone());
         self.command_buffers
             .borrow_mut()
             .last()
             .unwrap()
-            .encode_signal_event(&self.shared_event, query.0.event_value);
-            */
+            .encode_signal_event(&self.timer_query_shared_event, start_event_value);
     }
 
     fn end_timer_query(&self, query: &MetalTimerQuery) {
-        /*
+        let guard = query.0.mutex.lock().unwrap();
+        self.timer_query_shared_event
+            .notify_listener_at_value(&self.shared_event_listener,
+                                      guard.start_event_value + 1,
+                                      (*guard.end_block.as_ref().unwrap()).clone());
         self.command_buffers
             .borrow_mut()
             .last()
             .unwrap()
-            .encode_signal_event(&self.shared_event, query.0.event_value + 1);
-            */
+            .encode_signal_event(&self.timer_query_shared_event, guard.start_event_value + 1);
     }
 
     fn try_recv_timer_query(&self, query: &MetalTimerQuery) -> Option<Duration> {
@@ -656,13 +1070,13 @@ impl Device for MetalDevice {
     }
 
     fn try_recv_texture_data(&self, receiver: &MetalTextureDataReceiver) -> Option<TextureData> {
-        try_recv_texture_data_with_guard(&mut receiver.0.mutex.lock().unwrap())
+        try_recv_data_with_guard(&mut receiver.0.mutex.lock().unwrap())
     }
 
     fn recv_texture_data(&self, receiver: &MetalTextureDataReceiver) -> TextureData {
         let mut guard = receiver.0.mutex.lock().unwrap();
         loop {
-            let texture_data = try_recv_texture_data_with_guard(&mut guard);
+            let texture_data = try_recv_data_with_guard(&mut guard);
             if let Some(texture_data) = texture_data {
                 return texture_data
             }
@@ -680,52 +1094,227 @@ impl Device for MetalDevice {
         let suffix = match kind {
             ShaderKind::Vertex => 'v',
             ShaderKind::Fragment => 'f',
+            ShaderKind::Compute => 'c',
         };
         let path = format!("shaders/metal/{}.{}s.metal", name, suffix);
         self.create_shader_from_source(name, &resources.slurp(&path).unwrap(), kind)
+    }
+
+    fn add_fence(&self) -> MetalFence {
+        let fence = MetalFence(Arc::new(MetalFenceInfo {
+            mutex: Mutex::new(MetalFenceStatus::Pending),
+            cond: Condvar::new(),
+        }));
+        let captured_fence = fence.clone();
+        let block = ConcreteBlock::new(move |_| {
+            *captured_fence.0.mutex.lock().unwrap() = MetalFenceStatus::Resolved;
+            captured_fence.0.cond.notify_all();
+        });
+        self.command_buffers.borrow_mut().last().unwrap().add_completed_handler(block.copy());
+        self.end_commands();
+        self.begin_commands();
+        fence
+    }
+
+    fn wait_for_fence(&self, fence: &MetalFence) {
+        let mut guard = fence.0.mutex.lock().unwrap();
+        while let MetalFenceStatus::Pending = *guard {
+            guard = fence.0.cond.wait(guard).unwrap();
+        }
     }
 }
 
 impl MetalDevice {
     fn get_uniform_index(&self, shader: &MetalShader, name: &str) -> Option<MetalUniformIndex> {
-        let uniforms = shader.uniforms.borrow();
-        let struct_type = match *uniforms {
-            ShaderUniforms::Unknown => panic!("get_uniform_index() called before reflection!"),
-            ShaderUniforms::NoUniforms => return None,
-            ShaderUniforms::Uniforms { ref struct_type, .. } => struct_type,
+        let uniforms = shader.arguments.borrow();
+        let arguments = match *uniforms {
+            None => panic!("get_uniform_index() called before reflection!"),
+            Some(ref arguments) => arguments,
         };
-        let main_member = match struct_type.member_from_name(&format!("u{}", name)) {
-            None => return None,
-            Some(main_member) => main_member,
+        let main_name = format!("u{}", name);
+        for argument_index in 0..arguments.len() {
+            let argument = arguments.object_at(argument_index);
+            let argument_name = argument.name();
+            if argument_name == &main_name {
+                return Some(MetalUniformIndex(argument.index()))
+            }
+        }
+        None
+    }
+
+    fn get_texture_index(&self, shader: &MetalShader, name: &str) -> Option<MetalTextureIndex> {
+        let arguments = shader.arguments.borrow();
+        let arguments = match *arguments {
+            None => panic!("get_texture_index() called before reflection!"),
+            Some(ref arguments) => arguments,
         };
-        let main_index = main_member.argument_index();
-        let sampler_index = match struct_type.member_from_name(&format!("u{}Smplr", name)) {
-            None => None,
-            Some(sampler_member) => Some(sampler_member.argument_index()),
+        let (main_name, sampler_name) = (format!("u{}", name), format!("u{}Smplr", name));
+        let (mut main_argument, mut sampler_argument) = (None, None);
+        for argument_index in 0..arguments.len() {
+            let argument = arguments.object_at(argument_index);
+            let argument_name = argument.name();
+            if argument_name == &main_name {
+                main_argument = Some(argument.index());
+            } else if argument_name == &sampler_name {
+                sampler_argument = Some(argument.index());
+            }
+        }
+        match (main_argument, sampler_argument) {
+            (Some(main), Some(sampler)) => Some(MetalTextureIndex { main, sampler }),
+            _ => None,
+        }
+    }
+
+    fn get_image_index(&self, shader: &MetalShader, name: &str) -> Option<MetalImageIndex> {
+        let uniforms = shader.arguments.borrow();
+        let arguments = match *uniforms {
+            None => panic!("get_image_index() called before reflection!"),
+            Some(ref arguments) => arguments,
         };
-        Some(MetalUniformIndex { main: main_index, sampler: sampler_index })
+        let main_name = format!("u{}", name);
+        for argument_index in 0..arguments.len() {
+            let argument = arguments.object_at(argument_index);
+            let argument_name = argument.name();
+            if argument_name == &main_name {
+                return Some(MetalImageIndex(argument.index()))
+            }
+        }
+        None
+    }
+
+    fn get_storage_buffer_index(&self, shader: &MetalShader, name: &str)
+                                -> Option<MetalStorageBufferIndex> {
+        let uniforms = shader.arguments.borrow();
+        let arguments = match *uniforms {
+            None => panic!("get_storage_buffer_index() called before reflection!"),
+            Some(ref arguments) => arguments,
+        };
+        let main_name = format!("i{}", name);
+        let mut main_argument = None;
+        for argument_index in 0..arguments.len() {
+            let argument = arguments.object_at(argument_index);
+            match argument.type_() {
+                MTLArgumentType::Buffer => {}
+                _ => continue,
+            }
+            match argument.buffer_data_type() {
+                MTLDataType::Struct => {}
+                _ => continue,
+            }
+            let struct_type = argument.buffer_struct_type();
+            if struct_type.member_from_name(&main_name).is_some() {
+                main_argument = Some(argument.index());
+            }
+        }
+        main_argument.map(MetalStorageBufferIndex)
     }
 
     fn populate_uniform_indices_if_necessary(&self,
                                              uniform: &MetalUniform,
                                              program: &MetalProgram) {
-
         let mut indices = uniform.indices.borrow_mut();
         if indices.is_some() {
             return;
         }
 
-        *indices = Some(MetalUniformIndices {
-            vertex: self.get_uniform_index(&program.vertex, &uniform.name),
-            fragment: self.get_uniform_index(&program.fragment, &uniform.name),
-        });
+        *indices = match program {
+            MetalProgram::Raster(MetalRasterProgram {
+                ref vertex_shader,
+                ref fragment_shader,
+            }) => {
+                Some(MetalUniformIndices(ProgramKind::Raster {
+                    vertex: self.get_uniform_index(vertex_shader, &uniform.name),
+                    fragment: self.get_uniform_index(fragment_shader, &uniform.name),
+                }))
+            }
+            MetalProgram::Compute(MetalComputeProgram { ref shader, .. }) => {
+                let uniform_index = self.get_uniform_index(shader, &uniform.name);
+                Some(MetalUniformIndices(ProgramKind::Compute(uniform_index)))
+            }
+        }
+    }
+
+    fn populate_texture_indices_if_necessary(&self,
+                                             texture_parameter: &MetalTextureParameter,
+                                             program: &MetalProgram) {
+        let mut indices = texture_parameter.indices.borrow_mut();
+        if indices.is_some() {
+            return;
+        }
+
+        *indices = match program {
+            MetalProgram::Raster(MetalRasterProgram {
+                ref vertex_shader,
+                ref fragment_shader,
+            }) => {
+                Some(MetalTextureIndices(ProgramKind::Raster {
+                    vertex: self.get_texture_index(vertex_shader, &texture_parameter.name),
+                    fragment: self.get_texture_index(fragment_shader, &texture_parameter.name),
+                }))
+            }
+            MetalProgram::Compute(MetalComputeProgram { ref shader, .. }) => {
+                let image_index = self.get_texture_index(shader, &texture_parameter.name);
+                Some(MetalTextureIndices(ProgramKind::Compute(image_index)))
+            }
+        }
+    }
+
+    fn populate_image_indices_if_necessary(&self,
+                                           image_parameter: &MetalImageParameter,
+                                           program: &MetalProgram) {
+        let mut indices = image_parameter.indices.borrow_mut();
+        if indices.is_some() {
+            return;
+        }
+
+        *indices = match program {
+            MetalProgram::Raster(MetalRasterProgram {
+                ref vertex_shader,
+                ref fragment_shader,
+            }) => {
+                Some(MetalImageIndices(ProgramKind::Raster {
+                    vertex: self.get_image_index(vertex_shader, &image_parameter.name),
+                    fragment: self.get_image_index(fragment_shader, &image_parameter.name),
+                }))
+            }
+            MetalProgram::Compute(MetalComputeProgram { ref shader, .. }) => {
+                let image_index = self.get_image_index(shader, &image_parameter.name);
+                Some(MetalImageIndices(ProgramKind::Compute(image_index)))
+            }
+        }
+    }
+
+    fn populate_storage_buffer_indices_if_necessary(&self,
+                                                    storage_buffer: &MetalStorageBuffer,
+                                                    program: &MetalProgram) {
+        let mut indices = storage_buffer.indices.borrow_mut();
+        if indices.is_some() {
+            return;
+        }
+
+        *indices = match program {
+            MetalProgram::Raster(MetalRasterProgram {
+                ref vertex_shader,
+                ref fragment_shader,
+            }) => {
+                Some(MetalStorageBufferIndices(ProgramKind::Raster {
+                    vertex: self.get_storage_buffer_index(vertex_shader, &storage_buffer.name),
+                    fragment: self.get_storage_buffer_index(fragment_shader, &storage_buffer.name),
+                }))
+            }
+            MetalProgram::Compute(MetalComputeProgram { ref shader, .. }) => {
+                let storage_buffer_index = self.get_storage_buffer_index(shader,
+                                                                         &storage_buffer.name);
+                Some(MetalStorageBufferIndices(ProgramKind::Compute(storage_buffer_index)))
+            }
+        }
     }
 
     fn render_target_color_texture(&self, render_target: &RenderTarget<MetalDevice>)
                                    -> Texture {
         match *render_target {
-            RenderTarget::Default {..} => self.drawable.texture().retain(),
-            RenderTarget::Framebuffer(framebuffer) => framebuffer.0.texture.retain(),
+            RenderTarget::Default {..} => self.main_color_texture.retain(),
+            RenderTarget::Framebuffer(framebuffer) => framebuffer.0.private_texture.retain(),
         }
     }
 
@@ -748,36 +1337,26 @@ impl MetalDevice {
         let command_buffers = self.command_buffers.borrow();
         let command_buffer = command_buffers.last().unwrap();
 
-        // FIXME(pcwalton): Is this necessary?
-        let mut blit_command_encoder = None;
-        for texture in render_state.textures {
-            if !texture.dirty.get() {
-                continue;
-            }
-            if blit_command_encoder.is_none() {
-                blit_command_encoder = Some(command_buffer.new_blit_command_encoder());
-            }
-            let blit_command_encoder =
-                blit_command_encoder.as_ref().expect("Where's the blit command encoder?");
-            blit_command_encoder.synchronize_resource(&texture.texture);
-            texture.dirty.set(false);
-        }
-        if let Some(blit_command_encoder) = blit_command_encoder {
-            blit_command_encoder.end_encoding();
-        }
-
         let render_pass_descriptor = self.create_render_pass_descriptor(render_state);
 
-        let encoder = command_buffer.new_render_command_encoder(&render_pass_descriptor).retain();
+        let encoder = command_buffer.new_render_command_encoder_retained(&render_pass_descriptor);
+
+        // Wait on the previous compute command, if any.
+        let compute_fence = self.compute_fence.borrow();
+        if let Some(ref compute_fence) = *compute_fence {
+            encoder.wait_for_fence_before_stages(compute_fence, MTLRenderStage::Vertex);
+        }
+
         self.set_viewport(&encoder, &render_state.viewport);
 
+        let program = match render_state.program {
+            MetalProgram::Raster(ref raster_program) => raster_program,
+            _ => panic!("Raster render command must use a raster program!"),
+        };
+
         let render_pipeline_descriptor = RenderPipelineDescriptor::new();
-        render_pipeline_descriptor.set_vertex_function(Some(&render_state.program
-                                                                         .vertex
-                                                                         .function));
-        render_pipeline_descriptor.set_fragment_function(Some(&render_state.program
-                                                                           .fragment
-                                                                           .function));
+        render_pipeline_descriptor.set_vertex_function(Some(&program.vertex_shader.function));
+        render_pipeline_descriptor.set_fragment_function(Some(&program.fragment_shader.function));
         render_pipeline_descriptor.set_vertex_descriptor(Some(&render_state.vertex_array
                                                                            .descriptor));
 
@@ -795,14 +1374,28 @@ impl MetalDevice {
             render_pipeline_descriptor.set_stencil_attachment_pixel_format(depth_stencil_format);
         }
 
-        let reflection_options = MTLPipelineOption::ArgumentInfo |
-            MTLPipelineOption::BufferTypeInfo;
-        let (render_pipeline_state, reflection) =
-            self.device.real_new_render_pipeline_state_with_reflection(&render_pipeline_descriptor,
-                                                                       reflection_options);
-
-        self.populate_shader_uniforms_if_necessary(&render_state.program.vertex, &reflection);
-        self.populate_shader_uniforms_if_necessary(&render_state.program.fragment, &reflection);
+        let render_pipeline_state = if program.vertex_shader.arguments.borrow().is_none() ||
+                program.fragment_shader.arguments.borrow().is_none() {
+            let reflection_options = MTLPipelineOption::ArgumentInfo |
+                MTLPipelineOption::BufferTypeInfo;
+            let (render_pipeline_state, reflection) =
+                self.device
+                    .real_new_render_pipeline_state_with_reflection(&render_pipeline_descriptor,
+                                                                    reflection_options);
+            let mut vertex_arguments = program.vertex_shader.arguments.borrow_mut();
+            let mut fragment_arguments = program.fragment_shader.arguments.borrow_mut();
+            if vertex_arguments.is_none() {
+                *vertex_arguments = Some(reflection.real_vertex_arguments());
+            }
+            if fragment_arguments.is_none() {
+                *fragment_arguments = Some(reflection.real_fragment_arguments());
+            }
+            render_pipeline_state
+        } else {
+            self.device
+                .new_render_pipeline_state(&render_pipeline_descriptor)
+                .expect("Failed to create render pipeline state!")
+        };
 
         for (vertex_buffer_index, vertex_buffer) in render_state.vertex_array
                                                                 .vertex_buffers
@@ -810,103 +1403,210 @@ impl MetalDevice {
                                                                 .iter()
                                                                 .enumerate() {
             let real_index = vertex_buffer_index as u64 + FIRST_VERTEX_BUFFER_INDEX;
-            let buffer = vertex_buffer.buffer.borrow();
-            let buffer = buffer.as_ref()
+            let buffer = vertex_buffer.allocations.borrow();
+            let buffer = buffer.private
+                               .as_ref()
                                .map(|buffer| buffer.as_ref())
-                               .expect("Where's the vertex buffer?");
+                               .expect("Where's the private vertex buffer?");
             encoder.set_vertex_buffer(real_index, Some(buffer), 0);
-            encoder.use_resource(buffer, MTLResourceUsage::Read);
         }
 
-        self.set_uniforms(&encoder, render_state);
+        self.set_raster_uniforms(&encoder, render_state);
         encoder.set_render_pipeline_state(&render_pipeline_state);
         self.set_depth_stencil_state(&encoder, render_state);
+
         encoder
     }
 
-    fn populate_shader_uniforms_if_necessary(&self,
-                                             shader: &MetalShader,
-                                             reflection: &RenderPipelineReflectionRef) {
-        let mut uniforms = shader.uniforms.borrow_mut();
-        match *uniforms {
-            ShaderUniforms::Unknown => {}
-            ShaderUniforms::NoUniforms | ShaderUniforms::Uniforms { .. } => return,
-        }
-
-        let arguments = match shader.function.function_type() {
-            MTLFunctionType::Vertex => reflection.real_vertex_arguments(),
-            MTLFunctionType::Fragment => reflection.real_fragment_arguments(),
-            _ => panic!("Unexpected shader function type!"),
+    fn set_raster_uniforms(&self,
+                           render_command_encoder: &RenderCommandEncoderRef,
+                           render_state: &RenderState<MetalDevice>) {
+        let program = match render_state.program {
+            MetalProgram::Raster(ref raster_program) => raster_program,
+            _ => unreachable!(),
         };
 
-        let mut has_descriptor_set = false;
-        for argument_index in 0..arguments.len() {
-            let argument = arguments.object_at(argument_index);
-            if argument.name() == "spvDescriptorSet0" {
-                has_descriptor_set = true;
-                break;
-            }
-        }
-        if !has_descriptor_set {
-            *uniforms = ShaderUniforms::NoUniforms;
+        let vertex_arguments = program.vertex_shader.arguments.borrow();
+        let fragment_arguments = program.fragment_shader.arguments.borrow();
+        if vertex_arguments.is_none() && fragment_arguments.is_none() {
             return;
         }
 
-        let (encoder, argument) = shader.function.new_argument_encoder_with_reflection(0);
-        match argument.buffer_data_type() {
-            MTLDataType::Struct => {}
-            data_type => {
-                panic!("Unexpected data type for argument buffer: {}!", data_type as u32)
+        // Set uniforms.
+        let uniform_buffer = self.create_uniform_buffer(&render_state.uniforms);
+        for (&(uniform, _), buffer_range) in
+                render_state.uniforms.iter().zip(uniform_buffer.ranges.iter()) {
+            self.populate_uniform_indices_if_necessary(uniform, &render_state.program);
+
+            let indices = uniform.indices.borrow_mut();
+            let indices = indices.as_ref().unwrap();
+            let (vertex_indices, fragment_indices) = match indices.0 {
+                ProgramKind::Raster { ref vertex, ref fragment } => (vertex, fragment),
+                _ => unreachable!(),
+            };
+
+            if let Some(vertex_index) = *vertex_indices {
+                self.set_vertex_uniform(vertex_index,
+                                        &uniform_buffer.data,
+                                        buffer_range,
+                                        render_command_encoder);
+            }
+            if let Some(fragment_index) = *fragment_indices {
+                self.set_fragment_uniform(fragment_index,
+                                          &uniform_buffer.data,
+                                          buffer_range,
+                                          render_command_encoder);
             }
         }
-        let struct_type = argument.buffer_struct_type().retain();
-        *uniforms = ShaderUniforms::Uniforms { encoder, struct_type };
+
+        // Set textures.
+        for &(texture_param, texture) in render_state.textures {
+            self.populate_texture_indices_if_necessary(texture_param, &render_state.program);
+
+            let indices = texture_param.indices.borrow_mut();
+            let indices = indices.as_ref().unwrap();
+            let (vertex_indices, fragment_indices) = match indices.0 {
+                ProgramKind::Raster { ref vertex, ref fragment } => (vertex, fragment),
+                _ => unreachable!(),
+            };
+
+            if let Some(vertex_index) = *vertex_indices {
+                self.encode_vertex_texture_parameter(vertex_index,
+                                                     render_command_encoder,
+                                                     texture);
+            }
+            if let Some(fragment_index) = *fragment_indices {
+                self.encode_fragment_texture_parameter(fragment_index,
+                                                       render_command_encoder,
+                                                       texture);
+            }
+        }
+
+        // Set images.
+        for &(image_param, image, _) in render_state.images {
+            self.populate_image_indices_if_necessary(image_param, &render_state.program);
+
+            let indices = image_param.indices.borrow_mut();
+            let indices = indices.as_ref().unwrap();
+            let (vertex_indices, fragment_indices) = match indices.0 {
+                ProgramKind::Raster { ref vertex, ref fragment } => (vertex, fragment),
+                _ => unreachable!(),
+            };
+
+            if let Some(vertex_index) = *vertex_indices {
+                render_command_encoder.set_vertex_texture(vertex_index.0,
+                                                          Some(&image.private_texture));
+            }
+            if let Some(fragment_index) = *fragment_indices {
+                render_command_encoder.set_fragment_texture(fragment_index.0,
+                                                            Some(&image.private_texture));
+            }
+        }
+
+        // Set storage buffers.
+        for &(storage_buffer_id, storage_buffer_binding) in render_state.storage_buffers {
+            self.populate_storage_buffer_indices_if_necessary(storage_buffer_id,
+                                                              &render_state.program);
+
+            let indices = storage_buffer_id.indices.borrow_mut();
+            let indices = indices.as_ref().unwrap();
+            let (vertex_indices, fragment_indices) = match indices.0 {
+                ProgramKind::Raster { ref vertex, ref fragment } => (vertex, fragment),
+                _ => unreachable!(),
+            };
+
+            if let Some(vertex_index) = *vertex_indices {
+                if let Some(ref buffer) = storage_buffer_binding.allocations.borrow().private {
+                    render_command_encoder.set_vertex_buffer(vertex_index.0, Some(buffer), 0);
+                }
+            }
+            if let Some(fragment_index) = *fragment_indices {
+                if let Some(ref buffer) = storage_buffer_binding.allocations.borrow().private {
+                    render_command_encoder.set_fragment_buffer(fragment_index.0, Some(buffer), 0);
+                }
+            }
+        }
     }
 
-    fn create_argument_buffer(&self, shader: &MetalShader) -> Option<Buffer> {
-        let uniforms = shader.uniforms.borrow();
-        let encoder = match *uniforms {
-            ShaderUniforms::Unknown => unreachable!(),
-            ShaderUniforms::NoUniforms => return None,
-            ShaderUniforms::Uniforms { ref encoder, .. } => encoder,
-        };
+    fn set_compute_uniforms(&self,
+                            compute_command_encoder: &ComputeCommandEncoder,
+                            compute_state: &ComputeState<MetalDevice>) {
+        // Set uniforms.
+        let uniform_buffer = self.create_uniform_buffer(&compute_state.uniforms);
+        for (&(uniform, _), buffer_range) in
+                compute_state.uniforms.iter().zip(uniform_buffer.ranges.iter()) {
+            self.populate_uniform_indices_if_necessary(uniform, &compute_state.program);
 
-        let buffer_options = MTLResourceOptions::CPUCacheModeDefaultCache |
-            MTLResourceOptions::StorageModeManaged;
-        let buffer = self.device.new_buffer(encoder.encoded_length(), buffer_options);
-        encoder.set_argument_buffer(&buffer, 0);
-        Some(buffer)
+            let indices = uniform.indices.borrow_mut();
+            let indices = indices.as_ref().unwrap();
+            let indices = match indices.0 {
+                ProgramKind::Compute(ref indices) => indices,
+                _ => unreachable!(),
+            };
+
+            if let Some(indices) = *indices {
+                self.set_compute_uniform(indices,
+                                         &uniform_buffer.data,
+                                         buffer_range,
+                                         compute_command_encoder);
+            }
+        }
+
+        // Set textures.
+        for &(texture_param, texture) in compute_state.textures {
+            self.populate_texture_indices_if_necessary(texture_param, &compute_state.program);
+
+            let indices = texture_param.indices.borrow_mut();
+            let indices = indices.as_ref().unwrap();
+            let indices = match indices.0 {
+                ProgramKind::Compute(ref indices) => indices,
+                _ => unreachable!(),
+            };
+
+            if let Some(indices) = *indices {
+                self.encode_compute_texture_parameter(indices, compute_command_encoder, texture);
+            }
+        }
+
+        // Set images.
+        for &(image_param, image, _) in compute_state.images {
+            self.populate_image_indices_if_necessary(image_param, &compute_state.program);
+
+            let indices = image_param.indices.borrow_mut();
+            let indices = indices.as_ref().unwrap();
+            let indices = match indices.0 {
+                ProgramKind::Compute(ref indices) => indices,
+                _ => unreachable!(),
+            };
+
+            if let Some(indices) = *indices {
+                compute_command_encoder.set_texture(indices.0, Some(&image.private_texture));
+            }
+        }
+
+        // Set storage buffers.
+        for &(storage_buffer_id, storage_buffer_binding) in compute_state.storage_buffers {
+            self.populate_storage_buffer_indices_if_necessary(storage_buffer_id,
+                                                              &compute_state.program);
+
+            let indices = storage_buffer_id.indices.borrow_mut();
+            let indices = indices.as_ref().unwrap();
+            let indices = match indices.0 {
+                ProgramKind::Compute(ref indices) => indices,
+                _ => unreachable!(),
+            };
+
+            if let Some(index) = *indices {
+                if let Some(ref buffer) = storage_buffer_binding.allocations.borrow().private {
+                    compute_command_encoder.set_buffer(index.0, Some(buffer), 0);
+                }
+            }
+        }
     }
 
-    fn set_uniforms(&self,
-                    render_command_encoder: &RenderCommandEncoderRef,
-                    render_state: &RenderState<MetalDevice>) {
-        let vertex_argument_buffer = self.create_argument_buffer(&render_state.program.vertex);
-        let fragment_argument_buffer = self.create_argument_buffer(&render_state.program.fragment);
-
-        let vertex_uniforms = render_state.program.vertex.uniforms.borrow();
-        let fragment_uniforms = render_state.program.fragment.uniforms.borrow();
-
-        let (mut have_vertex_uniforms, mut have_fragment_uniforms) = (false, false);
-        if let ShaderUniforms::Uniforms { .. } = *vertex_uniforms {
-            have_vertex_uniforms = true;
-            let vertex_argument_buffer = vertex_argument_buffer.as_ref().unwrap();
-            render_command_encoder.use_resource(vertex_argument_buffer, MTLResourceUsage::Read);
-            render_command_encoder.set_vertex_buffer(0, Some(vertex_argument_buffer), 0);
-        }
-        if let ShaderUniforms::Uniforms { .. } = *fragment_uniforms {
-            have_fragment_uniforms = true;
-            let fragment_argument_buffer = fragment_argument_buffer.as_ref().unwrap();
-            render_command_encoder.use_resource(fragment_argument_buffer, MTLResourceUsage::Read);
-            render_command_encoder.set_fragment_buffer(0, Some(fragment_argument_buffer), 0);
-        }
-
-        if !have_vertex_uniforms && !have_fragment_uniforms {
-            return;
-        }
-
+    fn create_uniform_buffer(&self, uniforms: &[(&MetalUniform, UniformData)]) -> UniformBuffer {
         let (mut uniform_buffer_data, mut uniform_buffer_ranges) = (vec![], vec![]);
-        for &(_, uniform_data) in render_state.uniforms.iter() {
+        for &(_, uniform_data) in uniforms.iter() {
             let start_index = uniform_buffer_data.len();
             match uniform_data {
                 UniformData::Float(value) => {
@@ -953,93 +1653,80 @@ impl MetalDevice {
                     uniform_buffer_data.write_f32::<NativeEndian>(vector.z()).unwrap();
                     uniform_buffer_data.write_f32::<NativeEndian>(vector.w()).unwrap();
                 }
-                UniformData::TextureUnit(_) => {}
             }
             let end_index = uniform_buffer_data.len();
+            while uniform_buffer_data.len() % 256 != 0 {
+                uniform_buffer_data.push(0);
+            }
             uniform_buffer_ranges.push(start_index..end_index);
         }
 
-        let buffer_options = MTLResourceOptions::CPUCacheModeWriteCombined |
-            MTLResourceOptions::StorageModeManaged;
-        let data_buffer = self.device
-                              .new_buffer_with_data(uniform_buffer_data.as_ptr() as *const _,
-                                                    uniform_buffer_data.len() as u64,
-                                                    buffer_options);
-
-        for (&(uniform, ref uniform_data), buffer_range) in
-                render_state.uniforms.iter().zip(uniform_buffer_ranges.iter()) {
-            self.populate_uniform_indices_if_necessary(uniform, &render_state.program);
-            let indices = uniform.indices.borrow_mut();
-            let indices = indices.as_ref().unwrap();
-            if let Some(vertex_index) = indices.vertex {
-                if let ShaderUniforms::Uniforms {
-                    encoder: ref argument_encoder,
-                    ..
-                } = *vertex_uniforms {
-                    self.set_uniform(vertex_index,
-                                     argument_encoder,
-                                     uniform_data,
-                                     &data_buffer,
-                                     buffer_range.start as u64,
-                                     render_command_encoder,
-                                     render_state);
-                }
-            }
-            if let Some(fragment_index) = indices.fragment {
-                if let ShaderUniforms::Uniforms {
-                    encoder: ref argument_encoder,
-                    ..
-                } = *fragment_uniforms {
-                    self.set_uniform(fragment_index,
-                                     argument_encoder,
-                                     uniform_data,
-                                     &data_buffer,
-                                     buffer_range.start as u64,
-                                     render_command_encoder,
-                                     render_state);
-                }
-            }
-        }
-
-        render_command_encoder.use_resource(&data_buffer, MTLResourceUsage::Read);
-
-        // Metal expects the data buffer to remain live. (Issue #199.)
-        // FIXME(pcwalton): When do we deallocate this? What are the expected
-        // lifetime semantics?
-        mem::forget(data_buffer);
-
-        if let Some(vertex_argument_buffer) = vertex_argument_buffer {
-            let range = NSRange::new(0, vertex_argument_buffer.length());
-            vertex_argument_buffer.did_modify_range(range);
-        }
-        if let Some(fragment_argument_buffer) = fragment_argument_buffer {
-            let range = NSRange::new(0, fragment_argument_buffer.length());
-            fragment_argument_buffer.did_modify_range(range);
+        UniformBuffer {
+            data: uniform_buffer_data,
+            ranges: uniform_buffer_ranges,
         }
     }
 
-    fn set_uniform(&self,
-                   argument_index: MetalUniformIndex,
-                   argument_encoder: &ArgumentEncoder,
-                   uniform_data: &UniformData,
-                   buffer: &Buffer,
-                   buffer_offset: u64,
-                   render_command_encoder: &RenderCommandEncoderRef,
-                   render_state: &RenderState<MetalDevice>) {
-        match *uniform_data {
-            UniformData::TextureUnit(unit) => {
-                let texture = render_state.textures[unit as usize];
-                argument_encoder.set_texture(&texture.texture, argument_index.main);
-                let mut resource_usage = MTLResourceUsage::Read;
-                if let Some(sampler_index) = argument_index.sampler {
-                    let sampler = &self.samplers[texture.sampling_flags.get().bits() as usize];
-                    argument_encoder.set_sampler_state(sampler, sampler_index);
-                    resource_usage |= MTLResourceUsage::Sample;
-                }
-                render_command_encoder.use_resource(&texture.texture, resource_usage);
-            }
-            _ => argument_encoder.set_buffer(buffer, buffer_offset, argument_index.main),
-        }
+    fn set_vertex_uniform(&self,
+                          argument_index: MetalUniformIndex,
+                          buffer: &[u8],
+                          buffer_range: &Range<usize>,
+                          render_command_encoder: &RenderCommandEncoderRef) {
+        render_command_encoder.set_vertex_bytes(
+            argument_index.0,
+            (buffer_range.end - buffer_range.start) as u64,
+            &buffer[buffer_range.start as usize] as *const u8 as *const _)
+    }
+
+    fn set_fragment_uniform(&self,
+                            argument_index: MetalUniformIndex,
+                            buffer: &[u8],
+                            buffer_range: &Range<usize>,
+                            render_command_encoder: &RenderCommandEncoderRef) {
+        render_command_encoder.set_fragment_bytes(
+            argument_index.0,
+            (buffer_range.end - buffer_range.start) as u64,
+            &buffer[buffer_range.start as usize] as *const u8 as *const _)
+    }
+
+    fn set_compute_uniform(&self,
+                           argument_index: MetalUniformIndex,
+                           buffer: &[u8],
+                           buffer_range: &Range<usize>,
+                           compute_command_encoder: &ComputeCommandEncoder) {
+        compute_command_encoder.set_bytes(
+            argument_index.0,
+            (buffer_range.end - buffer_range.start) as u64,
+            &buffer[buffer_range.start as usize] as *const u8 as *const _)
+    }
+
+    fn encode_vertex_texture_parameter(&self,
+                                       argument_index: MetalTextureIndex,
+                                       render_command_encoder: &RenderCommandEncoderRef,
+                                       texture: &MetalTexture) {
+        render_command_encoder.set_vertex_texture(argument_index.main,
+                                                  Some(&texture.private_texture));
+        let sampler = &self.samplers[texture.sampling_flags.get().bits() as usize];
+        render_command_encoder.set_vertex_sampler_state(argument_index.sampler, Some(sampler));
+    }
+
+    fn encode_fragment_texture_parameter(&self,
+                                         argument_index: MetalTextureIndex,
+                                         render_command_encoder: &RenderCommandEncoderRef,
+                                         texture: &MetalTexture) {
+        render_command_encoder.set_fragment_texture(argument_index.main,
+                                                    Some(&texture.private_texture));
+        let sampler = &self.samplers[texture.sampling_flags.get().bits() as usize];
+        render_command_encoder.set_fragment_sampler_state(argument_index.sampler, Some(sampler));
+    }
+
+    fn encode_compute_texture_parameter(&self,
+                                        argument_index: MetalTextureIndex,
+                                        compute_command_encoder: &ComputeCommandEncoder,
+                                        texture: &MetalTexture) {
+        compute_command_encoder.set_texture(argument_index.main, Some(&texture.private_texture));
+        let sampler = &self.samplers[texture.sampling_flags.get().bits() as usize];
+        compute_command_encoder.set_sampler_state(argument_index.sampler, Some(sampler));
     }
 
     fn prepare_pipeline_color_attachment_for_render(
@@ -1078,7 +1765,7 @@ impl MetalDevice {
 
     fn create_render_pass_descriptor(&self, render_state: &RenderState<MetalDevice>)
                                      -> RenderPassDescriptor {
-        let render_pass_descriptor = RenderPassDescriptor::new().retain();
+        let render_pass_descriptor = RenderPassDescriptor::new_retained();
         let color_attachment = render_pass_descriptor.color_attachments().object_at(0).unwrap();
         color_attachment.set_texture(Some(&self.render_target_color_texture(render_state.target)));
 
@@ -1185,12 +1872,12 @@ impl MetalDevice {
     }
 
     fn synchronize_texture(&self, texture: &Texture, block: RcBlock<(*mut Object,), ()>) {
-        unsafe {
+        {
             let command_buffers = self.command_buffers.borrow();
             let command_buffer = command_buffers.last().unwrap();
-            let encoder = command_buffer.new_blit_command_encoder();
+            let encoder = command_buffer.real_new_blit_command_encoder();
             encoder.synchronize_resource(&texture);
-            let () = msg_send![*command_buffer, addCompletedHandler:&*block];
+            command_buffer.add_completed_handler(block);
             encoder.end_encoding();
         }
 
@@ -1213,6 +1900,60 @@ impl DeviceExtra for metal::Device {
         descriptor.set_storage_mode(MTLStorageMode::Private);
         descriptor.set_usage(MTLTextureUsage::Unknown);
         self.new_texture(&descriptor)
+    }
+}
+
+// Helper types
+
+struct UniformBuffer {
+    data: Vec<u8>,
+    ranges: Vec<Range<usize>>,
+}
+
+// Miscellaneous extra public methods
+
+impl MetalTexture {
+    #[inline]
+    pub fn metal_texture(&self) -> Texture {
+        self.private_texture.clone()
+    }
+}
+
+pub trait IntoTexture {
+    unsafe fn into_texture(self, metal_device: &metal::Device) -> Texture;
+}
+
+impl IntoTexture for Texture {
+    #[inline]
+    unsafe fn into_texture(self, _: &metal::Device) -> Texture {
+        self
+    }
+}
+
+impl IntoTexture for IOSurfaceRef {
+    #[inline]
+    unsafe fn into_texture(self, metal_device: &metal::Device) -> Texture {
+        let width = IOSurfaceGetWidth(self);
+        let height = IOSurfaceGetHeight(self);
+
+        let descriptor = TextureDescriptor::new();
+        descriptor.set_texture_type(MTLTextureType::D2);
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_width(width as u64);
+        descriptor.set_height(height as u64);
+        descriptor.set_storage_mode(MTLStorageMode::Private);
+        descriptor.set_usage(MTLTextureUsage::Unknown);
+
+        msg_send![*metal_device, newTextureWithDescriptor:descriptor.as_ptr()
+                                                iosurface:self
+                                                    plane:0]
+    }
+}
+
+impl<'a> IntoTexture for &'a CoreAnimationDrawableRef {
+    #[inline]
+    unsafe fn into_texture(self, _: &metal::Device) -> Texture {
+        self.texture().retain()
     }
 }
 
@@ -1254,6 +1995,33 @@ impl BlendOpExt for BlendOp {
     }
 }
 
+trait BufferUploadModeExt {
+    fn to_metal_resource_options(self) -> MTLResourceOptions;
+}
+
+impl BufferUploadModeExt for BufferUploadMode {
+    #[inline]
+    fn to_metal_resource_options(self) -> MTLResourceOptions {
+        let mut options = match self {
+            BufferUploadMode::Static => MTLResourceOptions::CPUCacheModeWriteCombined,
+            BufferUploadMode::Dynamic => MTLResourceOptions::CPUCacheModeDefaultCache,
+        };
+        options |= MTLResourceOptions::StorageModePrivate;
+        options
+    }
+}
+
+trait ComputeDimensionsExt {
+    fn to_metal_size(self) -> MTLSize;
+}
+
+impl ComputeDimensionsExt for ComputeDimensions {
+    #[inline]
+    fn to_metal_size(self) -> MTLSize {
+        MTLSize { width: self.x as u64, height: self.y as u64, depth: self.z as u64 }
+    }
+}
+
 trait DepthFuncExt {
     fn to_metal_compare_function(self) -> MTLCompareFunction;
 }
@@ -1263,6 +2031,20 @@ impl DepthFuncExt for DepthFunc {
         match self {
             DepthFunc::Less => MTLCompareFunction::Less,
             DepthFunc::Always => MTLCompareFunction::Always,
+        }
+    }
+}
+
+trait ImageAccessExt {
+    fn to_metal_resource_usage(self) -> MTLResourceUsage;
+}
+
+impl ImageAccessExt for ImageAccess {
+    fn to_metal_resource_usage(self) -> MTLResourceUsage {
+        match self {
+            ImageAccess::Read => MTLResourceUsage::Read,
+            ImageAccess::Write => MTLResourceUsage::Write,
+            ImageAccess::ReadWrite => MTLResourceUsage::Read | MTLResourceUsage::Write,
         }
     }
 }
@@ -1294,40 +2076,39 @@ impl StencilFuncExt for StencilFunc {
 }
 
 trait UniformDataExt {
-    fn as_bytes(&self) -> Option<&[u8]>;
+    fn as_bytes(&self) -> &[u8];
 }
 
 impl UniformDataExt for UniformData {
-    fn as_bytes(&self) -> Option<&[u8]> {
+    fn as_bytes(&self) -> &[u8] {
         unsafe {
             match *self {
-                UniformData::TextureUnit(_) => None,
                 UniformData::Float(ref data) => {
-                    Some(slice::from_raw_parts(data as *const f32 as *const u8, 4 * 1))
+                    slice::from_raw_parts(data as *const f32 as *const u8, 4 * 1)
                 }
                 UniformData::IVec2(ref data) => {
-                    Some(slice::from_raw_parts(data as *const I32x2 as *const u8, 4 * 3))
+                    slice::from_raw_parts(data as *const I32x2 as *const u8, 4 * 3)
                 }
                 UniformData::IVec3(ref data) => {
-                    Some(slice::from_raw_parts(data as *const i32 as *const u8, 4 * 3))
+                    slice::from_raw_parts(data as *const i32 as *const u8, 4 * 3)
                 }
                 UniformData::Int(ref data) => {
-                    Some(slice::from_raw_parts(data as *const i32 as *const u8, 4 * 1))
+                    slice::from_raw_parts(data as *const i32 as *const u8, 4 * 1)
                 }
                 UniformData::Mat2(ref data) => {
-                    Some(slice::from_raw_parts(data as *const F32x4 as *const u8, 4 * 4))
+                    slice::from_raw_parts(data as *const F32x4 as *const u8, 4 * 4)
                 }
                 UniformData::Mat4(ref data) => {
-                    Some(slice::from_raw_parts(&data[0] as *const F32x4 as *const u8, 4 * 16))
+                    slice::from_raw_parts(&data[0] as *const F32x4 as *const u8, 4 * 16)
                 }
                 UniformData::Vec2(ref data) => {
-                    Some(slice::from_raw_parts(data as *const F32x2 as *const u8, 4 * 2))
+                    slice::from_raw_parts(data as *const F32x2 as *const u8, 4 * 2)
                 }
                 UniformData::Vec3(ref data) => {
-                    Some(slice::from_raw_parts(data as *const f32 as *const u8, 4 * 3))
+                    slice::from_raw_parts(data as *const f32 as *const u8, 4 * 3)
                 }
                 UniformData::Vec4(ref data) => {
-                    Some(slice::from_raw_parts(data as *const F32x4 as *const u8, 4 * 4))
+                    slice::from_raw_parts(data as *const F32x4 as *const u8, 4 * 4)
                 }
             }
         }
@@ -1409,21 +2190,34 @@ impl MetalTextureDataReceiver {
         };
 
         let mut guard = self.0.mutex.lock().unwrap();
-        *guard = MetalTextureDataReceiverState::Downloaded(texture_data);
+        *guard = MetalDataReceiverState::Downloaded(texture_data);
         self.0.cond.notify_all();
     }
 }
 
-fn try_recv_texture_data_with_guard(guard: &mut MutexGuard<MetalTextureDataReceiverState>)
-                                    -> Option<TextureData> {
+impl MetalBufferDataReceiver {
+    fn download(&self) {
+        let staging_buffer_contents = self.0.staging_buffer.contents() as *const u8;
+        let staging_buffer_length = self.0.staging_buffer.length();
+        unsafe {
+            let contents = slice::from_raw_parts(staging_buffer_contents,
+                                                 staging_buffer_length.try_into().unwrap());
+            let mut guard = self.0.mutex.lock().unwrap();
+            *guard = MetalDataReceiverState::Downloaded(contents.to_vec());
+            self.0.cond.notify_all();
+        }
+    }
+}
+
+fn try_recv_data_with_guard<T>(guard: &mut MutexGuard<MetalDataReceiverState<T>>) -> Option<T> {
     match **guard {
-        MetalTextureDataReceiverState::Pending | MetalTextureDataReceiverState::Finished => {
+        MetalDataReceiverState::Pending | MetalDataReceiverState::Finished => {
             return None
         }
-        MetalTextureDataReceiverState::Downloaded(_) => {}
+        MetalDataReceiverState::Downloaded(_) => {}
     }
-    match mem::replace(&mut **guard, MetalTextureDataReceiverState::Finished) {
-        MetalTextureDataReceiverState::Downloaded(texture_data) => Some(texture_data),
+    match mem::replace(&mut **guard, MetalDataReceiverState::Finished) {
+        MetalDataReceiverState::Downloaded(texture_data) => Some(texture_data),
         _ => unreachable!(),
     }
 }
@@ -1512,11 +2306,20 @@ impl Drop for SharedEventListener {
 }
 
 impl SharedEventListener {
-    fn new() -> SharedEventListener {
+    fn new_from_dispatch_queue(queue: &Queue) -> SharedEventListener {
         unsafe {
             let listener: *mut Object = msg_send![class!(MTLSharedEventListener), alloc];
-            SharedEventListener(msg_send![listener, init])
+            let raw_queue: *const *mut dispatch_queue_t = mem::transmute(queue);
+            SharedEventListener(msg_send![listener, initWithDispatchQueue:*raw_queue])
         }
+    }
+}
+
+struct Fence(*mut Object);
+
+impl Drop for Fence {
+    fn drop(&mut self) {
+        unsafe { msg_send![self.0, release] }
     }
 }
 
@@ -1559,12 +2362,60 @@ impl CoreAnimationLayerExt for CoreAnimationLayer {
 
 trait CommandBufferExt {
     fn encode_signal_event(&self, event: &SharedEvent, value: u64);
+    fn add_completed_handler(&self, block: RcBlock<(*mut Object,), ()>);
+    // Just like `new_render_command_encoder`, but returns an owned version.
+    fn new_render_command_encoder_retained(&self, render_pass_descriptor: &RenderPassDescriptorRef)
+                                           -> RenderCommandEncoder;
+    // Just like `new_blit_command_encoder`, but doesn't leak.
+    fn real_new_blit_command_encoder(&self) -> BlitCommandEncoder;
+    // Just like `new_compute_command_encoder`, but doesn't leak.
+    fn real_new_compute_command_encoder(&self) -> ComputeCommandEncoder;
 }
 
 impl CommandBufferExt for CommandBuffer {
     fn encode_signal_event(&self, event: &SharedEvent, value: u64) {
         unsafe {
             msg_send![self.as_ptr(), encodeSignalEvent:event.0 value:value]
+        }
+    }
+
+    fn add_completed_handler(&self, block: RcBlock<(*mut Object,), ()>) {
+        unsafe {
+            msg_send![self.as_ptr(), addCompletedHandler:&*block]
+        }
+    }
+
+    fn new_render_command_encoder_retained(&self, render_pass_descriptor: &RenderPassDescriptorRef)
+                                           -> RenderCommandEncoder {
+        unsafe {
+            RenderCommandEncoder::from_ptr(
+                msg_send![self.as_ptr(),
+                          renderCommandEncoderWithDescriptor:render_pass_descriptor.as_ptr()])
+        }
+    }
+
+    fn real_new_blit_command_encoder(&self) -> BlitCommandEncoder {
+        unsafe {
+            BlitCommandEncoder::from_ptr(msg_send![self.as_ptr(), blitCommandEncoder])
+        }
+    }
+
+    fn real_new_compute_command_encoder(&self) -> ComputeCommandEncoder {
+        unsafe {
+            ComputeCommandEncoder::from_ptr(msg_send![self.as_ptr(), computeCommandEncoder])
+        }
+    }
+}
+
+trait CommandQueueExt {
+    // Just like `new_command_buffer()`, but returns an owned version.
+    fn new_command_buffer_retained(&self) -> CommandBuffer;
+}
+
+impl CommandQueueExt for CommandQueue {
+    fn new_command_buffer_retained(&self) -> CommandBuffer {
+        unsafe {
+            CommandBuffer::from_ptr(msg_send![self.as_ptr(), commandBuffer])
         }
     }
 }
@@ -1578,6 +2429,7 @@ trait DeviceExt {
                                                       -> (RenderPipelineState,
                                                           RenderPipelineReflection);
     fn new_shared_event(&self) -> SharedEvent;
+    fn new_fence(&self) -> Fence;
 }
 
 impl DeviceExt for metal::Device {
@@ -1609,6 +2461,10 @@ impl DeviceExt for metal::Device {
 
     fn new_shared_event(&self) -> SharedEvent {
         unsafe { SharedEvent(msg_send![self.as_ptr(), newSharedEvent]) }
+    }
+
+    fn new_fence(&self) -> Fence {
+        unsafe { Fence(msg_send![self.as_ptr(), newFence]) }
     }
 }
 
@@ -1658,12 +2514,70 @@ impl RenderPipelineReflectionExt for RenderPipelineReflectionRef {
 
 trait StructMemberExt {
     fn argument_index(&self) -> u64;
+    fn pointer_type(&self) -> *mut Object;
 }
 
 impl StructMemberExt for StructMemberRef {
     fn argument_index(&self) -> u64 {
         unsafe { msg_send![self.as_ptr(), argumentIndex] }
     }
+
+    fn pointer_type(&self) -> *mut Object {
+        unsafe { msg_send![self.as_ptr(), pointerType] }
+    }
+}
+
+trait ComputeCommandEncoderExt {
+    fn update_fence(&self, fence: &Fence);
+    fn wait_for_fence(&self, fence: &Fence);
+}
+
+impl ComputeCommandEncoderExt for ComputeCommandEncoder {
+    fn update_fence(&self, fence: &Fence) {
+        unsafe { msg_send![self.as_ptr(), updateFence:fence.0] }
+    }
+
+    fn wait_for_fence(&self, fence: &Fence) {
+        unsafe { msg_send![self.as_ptr(), waitForFence:fence.0] }
+    }
+}
+
+trait RenderCommandEncoderExt {
+    fn update_fence_before_stages(&self, fence: &Fence, stages: MTLRenderStage);
+    fn wait_for_fence_before_stages(&self, fence: &Fence, stages: MTLRenderStage);
+}
+
+impl RenderCommandEncoderExt for RenderCommandEncoderRef {
+    fn update_fence_before_stages(&self, fence: &Fence, stages: MTLRenderStage) {
+        unsafe { msg_send![self.as_ptr(), updateFence:fence.0 beforeStages:stages] }
+    }
+
+    fn wait_for_fence_before_stages(&self, fence: &Fence, stages: MTLRenderStage) {
+        unsafe {
+            msg_send![self.as_ptr(), waitForFence:fence.0 beforeStages:stages]
+        }
+    }
+}
+
+trait RenderPassDescriptorExt {
+    // Returns a new owned version.
+    fn new_retained() -> Self;
+}
+
+impl RenderPassDescriptorExt for RenderPassDescriptor {
+    fn new_retained() -> RenderPassDescriptor {
+        unsafe {
+            RenderPassDescriptor::from_ptr(msg_send![class!(MTLRenderPassDescriptor),
+                                                     renderPassDescriptor])
+        }
+    }
+}
+
+#[repr(u32)]
+enum MTLRenderStage {
+    Vertex = 0,
+    #[allow(dead_code)]
+    Fragment = 1,
 }
 
 // Memory management helpers
@@ -1671,13 +2585,6 @@ impl StructMemberExt for StructMemberRef {
 trait Retain {
     type Owned;
     fn retain(&self) -> Self::Owned;
-}
-
-impl Retain for CommandBufferRef {
-    type Owned = CommandBuffer;
-    fn retain(&self) -> CommandBuffer {
-        unsafe { CommandBuffer::from_ptr(msg_send![self.as_ptr(), retain]) }
-    }
 }
 
 impl Retain for CoreAnimationDrawableRef {
@@ -1691,20 +2598,6 @@ impl Retain for CoreAnimationLayerRef {
     type Owned = CoreAnimationLayer;
     fn retain(&self) -> CoreAnimationLayer {
         unsafe { CoreAnimationLayer::from_ptr(msg_send![self.as_ptr(), retain]) }
-    }
-}
-
-impl Retain for RenderCommandEncoderRef {
-    type Owned = RenderCommandEncoder;
-    fn retain(&self) -> RenderCommandEncoder {
-        unsafe { RenderCommandEncoder::from_ptr(msg_send![self.as_ptr(), retain]) }
-    }
-}
-
-impl Retain for RenderPassDescriptorRef {
-    type Owned = RenderPassDescriptor;
-    fn retain(&self) -> RenderPassDescriptor {
-        unsafe { RenderPassDescriptor::from_ptr(msg_send![self.as_ptr(), retain]) }
     }
 }
 
@@ -1759,4 +2652,34 @@ struct BlockExtra<A, R> {
     unknown2: *mut i32,             // 0x10
     dtor: BlockExtraDtor<A, R>,     // 0x18
     signature: *const *const i8,    // 0x20
+}
+
+// TODO(pcwalton): These should go upstream to `core-foundation-rs`.
+#[link(name = "IOSurface", kind = "framework")]
+extern {
+    fn IOSurfaceGetWidth(buffer: IOSurfaceRef) -> size_t;
+    fn IOSurfaceGetHeight(buffer: IOSurfaceRef) -> size_t;
+}
+
+// Helper functions
+
+fn create_texture_descriptor(format: TextureFormat, size: Vector2I) -> TextureDescriptor {
+    let descriptor = TextureDescriptor::new();
+    descriptor.set_texture_type(MTLTextureType::D2);
+    match format {
+        TextureFormat::R8 => descriptor.set_pixel_format(MTLPixelFormat::R8Unorm),
+        TextureFormat::R16F => descriptor.set_pixel_format(MTLPixelFormat::R16Float),
+        TextureFormat::RGBA8 => descriptor.set_pixel_format(MTLPixelFormat::RGBA8Unorm),
+        TextureFormat::RGBA16F => descriptor.set_pixel_format(MTLPixelFormat::RGBA16Float),
+        TextureFormat::RGBA32F => descriptor.set_pixel_format(MTLPixelFormat::RGBA32Float),
+    }
+    descriptor.set_width(size.x() as u64);
+    descriptor.set_height(size.y() as u64);
+    descriptor.set_usage(MTLTextureUsage::Unknown);
+    descriptor
+}
+
+struct BufferUploadEventData {
+    mutex: Mutex<u64>,
+    cond: Condvar,
 }

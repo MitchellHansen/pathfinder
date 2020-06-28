@@ -15,10 +15,10 @@ use pathfinder_gl::{GLDevice, GLVersion};
 use pathfinder_renderer::concurrent::rayon::RayonExecutor;
 use pathfinder_renderer::concurrent::scene_proxy::SceneProxy;
 use pathfinder_renderer::gpu::renderer::Renderer;
-use pathfinder_renderer::gpu::options::{DestFramebuffer, RendererOptions};
+use pathfinder_renderer::gpu::options::{DestFramebuffer, RendererMode, RendererOptions};
 use pathfinder_renderer::options::{RenderTransform, BuildOptions};
 use pathfinder_resources::ResourceLoader;
-use pathfinder_resources::fs::FilesystemResourceLoader;
+use pathfinder_resources::embedded::EmbeddedResourceLoader;
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use sdl2::video::GLProfile;
@@ -28,7 +28,7 @@ use std::env;
 use std::fs::read;
 
 fn main() {
-    let resource_loader = FilesystemResourceLoader::locate();
+    let resource_loader = EmbeddedResourceLoader;
 
     let swf_bytes;
     if let Some(path) = env::args().skip(1).next() {
@@ -98,12 +98,15 @@ fn main() {
     window.gl_make_current(&gl_context).unwrap();
 
     // Create a Pathfinder renderer.
-    let mut renderer = Renderer::new(
-        GLDevice::new(GLVersion::GL3, 0),
-        &resource_loader,
-        DestFramebuffer::full_window(pixel_size),
-        RendererOptions { background_color: Some(stage.background_color()) }
-    );
+    let device = GLDevice::new(GLVersion::GL3, 0);
+    let mode = RendererMode::default_for_device(&device);
+    let options = RendererOptions {
+        background_color: Some(stage.background_color()),
+        dest: DestFramebuffer::full_window(pixel_size),
+        ..RendererOptions::default()
+    };
+    let mut renderer = Renderer::new(device, &resource_loader, mode, options);
+
     // Clear to swf stage background color.
     let mut scene = Scene::new();
     scene.set_view_box(RectF::new(Vector2F::zero(),
@@ -112,7 +115,7 @@ fn main() {
     draw_paths_into_scene(&library, &mut scene);
 
     // Render the canvas to screen.
-    let scene = SceneProxy::from_scene(scene, RayonExecutor);
+    let mut scene = SceneProxy::from_scene(scene, renderer.mode().level, RayonExecutor);
     let mut build_options = BuildOptions::default();
     let scale_transform = Transform2F::from_scale(device_pixel_ratio);
     build_options.transform = RenderTransform::Transform2D(scale_transform);

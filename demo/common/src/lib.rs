@@ -34,14 +34,15 @@ use pathfinder_geometry::transform2d::Transform2F;
 use pathfinder_geometry::transform3d::Transform4F;
 use pathfinder_geometry::vector::{Vector2F, Vector2I, Vector4F, vec2f, vec2i};
 use pathfinder_gpu::Device;
-use pathfinder_renderer::concurrent::scene_proxy::{RenderCommandStream, SceneProxy};
-use pathfinder_renderer::gpu::options::{DestFramebuffer, RendererOptions};
-use pathfinder_renderer::gpu::renderer::{RenderStats, RenderTime, Renderer};
+use pathfinder_renderer::concurrent::scene_proxy::SceneProxy;
+use pathfinder_renderer::gpu::options::{DestFramebuffer, RendererLevel};
+use pathfinder_renderer::gpu::options::{RendererMode, RendererOptions};
+use pathfinder_renderer::gpu::renderer::{DebugUIPresenterInfo, Renderer};
 use pathfinder_renderer::options::{BuildOptions, RenderTransform};
 use pathfinder_renderer::paint::Paint;
 use pathfinder_renderer::scene::{DrawPath, RenderTarget, Scene};
 use pathfinder_resources::ResourceLoader;
-use pathfinder_svg::BuiltSVG;
+use pathfinder_svg::SVGScene;
 use pathfinder_ui::{MousePosition, UIEvent};
 use std::fs::File;
 use std::io::{BufWriter, Read};
@@ -90,7 +91,6 @@ pub struct DemoApp<W> where W: Window {
     svg_tree: Tree,
     scene_metadata: SceneMetadata,
     render_transform: Option<RenderTransform>,
-    render_command_stream: Option<RenderCommandStream>,
 
     camera: Camera,
     frame_counter: u32,
@@ -116,13 +116,13 @@ pub struct DemoApp<W> where W: Window {
 }
 
 impl<W> DemoApp<W> where W: Window {
-    pub fn new(window: W, window_size: WindowSize, mut options: Options) -> DemoApp<W> {
+    pub fn new(window: W, window_size: WindowSize, options: Options) -> DemoApp<W> {
         let expire_message_event_id = window.create_user_event_id();
 
         let device;
         #[cfg(all(target_os = "macos", not(feature = "pf-gl")))]
-        {
-            device = DeviceImpl::new(window.metal_layer());
+        unsafe {
+            device = DeviceImpl::new(window.metal_device(), window.metal_io_surface());
         }
         #[cfg(any(not(target_os = "macos"), feature = "pf-gl"))]
         {
@@ -131,18 +131,29 @@ impl<W> DemoApp<W> where W: Window {
 
         let resources = window.resource_loader();
 
-        // Read command line options.
-        options.command_line_overrides();
-
         // Set up the executor.
         let executor = DemoExecutor::new(options.jobs);
 
         let mut ui_model = DemoUIModel::new(&options);
-        let render_options = RendererOptions { background_color: None };
+
+        let level = match options.renderer_level {
+            Some(level) => level,
+            None => RendererLevel::default_for_device(&device),
+        };
+        let viewport = window.viewport(options.mode.view(0));
+        let dest_framebuffer = DestFramebuffer::Default {
+            viewport,
+            window_size: window_size.device_size(),
+        };
+        let render_mode = RendererMode { level };
+        let render_options = RendererOptions {
+            dest: dest_framebuffer,
+            background_color: None,
+            show_debug_ui: true,
+        };
 
         let filter = build_filter(&ui_model);
 
-        let viewport = window.viewport(options.mode.view(0));
         let (mut built_svg, svg_tree) = load_scene(resources,
                                                    &options.input_path,
                                                    viewport.size(),
@@ -150,21 +161,16 @@ impl<W> DemoApp<W> where W: Window {
 
         let message = get_svg_building_message(&built_svg);
 
-        let dest_framebuffer = DestFramebuffer::Default {
-            viewport,
-            window_size: window_size.device_size(),
-        };
-
-        let renderer = Renderer::new(device, resources, dest_framebuffer, render_options);
+        let renderer = Renderer::new(device, resources, render_mode, render_options);
 
         let scene_metadata = SceneMetadata::new_clipping_view_box(&mut built_svg.scene,
                                                                   viewport.size());
         let camera = Camera::new(options.mode, scene_metadata.view_box, viewport.size());
 
-        let scene_proxy = SceneProxy::from_scene(built_svg.scene, executor);
+        let scene_proxy = SceneProxy::from_scene(built_svg.scene, level, executor);
 
-        let ground_program = GroundProgram::new(&renderer.device, resources);
-        let ground_vertex_array = GroundVertexArray::new(&renderer.device,
+        let ground_program = GroundProgram::new(renderer.device(), resources);
+        let ground_vertex_array = GroundVertexArray::new(renderer.device(),
                                                          &ground_program,
                                                          &renderer.quad_vertex_positions_buffer(),
                                                          &renderer.quad_vertex_indices_buffer());
@@ -177,7 +183,7 @@ impl<W> DemoApp<W> where W: Window {
             message,
         );
 
-        let ui_presenter = DemoUIPresenter::new(&renderer.device, resources);
+        let ui_presenter = DemoUIPresenter::new(renderer.device(), resources);
 
         DemoApp {
             window,
@@ -189,7 +195,6 @@ impl<W> DemoApp<W> where W: Window {
             svg_tree,
             scene_metadata,
             render_transform: None,
-            render_command_stream: None,
 
             camera,
             frame_counter: 0,
@@ -265,7 +270,11 @@ impl<W> DemoApp<W> where W: Window {
             subpixel_aa_enabled: self.ui_model.subpixel_aa_effect_enabled,
         };
 
-        self.render_command_stream = Some(self.scene_proxy.build_with_stream(build_options));
+        self.scene_proxy.build(build_options);
+        /*
+        self.render_command_stream =    
+            Some(self.scene_proxy.build_with_stream(build_options, self.renderer.gpu_features()));
+            */
     }
 
     fn handle_events(&mut self, events: Vec<Event>) -> Vec<UIEvent> {
@@ -461,7 +470,7 @@ impl<W> DemoApp<W> where W: Window {
     }
 
     fn process_mouse_position(&mut self, new_position: Vector2I) -> MousePosition {
-        let absolute = new_position * self.window_size.backing_scale_factor as i32;
+        let absolute = (new_position.to_f32() * self.window_size.backing_scale_factor).to_i32();
         let relative = absolute - self.last_mouse_position;
         self.last_mouse_position = absolute;
         MousePosition { absolute, relative }
@@ -469,55 +478,39 @@ impl<W> DemoApp<W> where W: Window {
 
     pub fn finish_drawing_frame(&mut self) {
         self.maybe_take_screenshot();
-        self.update_stats();
-        self.draw_debug_ui();
 
         let frame = self.current_frame.take().unwrap();
         for ui_event in &frame.ui_events {
             self.dirty = true;
-            self.renderer.debug_ui_presenter.ui_presenter.event_queue.push(*ui_event);
+            self.renderer
+                .debug_ui_presenter_mut()
+                .debug_ui_presenter
+                .ui_presenter
+                .event_queue
+                .push(*ui_event);
         }
 
-        self.renderer.debug_ui_presenter.ui_presenter.mouse_position =
+        self.renderer.debug_ui_presenter_mut().debug_ui_presenter.ui_presenter.mouse_position =
             self.last_mouse_position.to_f32() * self.window_size.backing_scale_factor;
 
         let mut ui_action = UIAction::None;
         if self.options.ui == UIVisibility::All {
-            self.ui_presenter.update(
-                &self.renderer.device,
-                &mut self.window,
-                &mut self.renderer.debug_ui_presenter,
-                &mut ui_action,
-                &mut self.ui_model,
-            );
+            let DebugUIPresenterInfo { device, allocator, debug_ui_presenter } =
+                self.renderer.debug_ui_presenter_mut();
+            self.ui_presenter.update(device,
+                                     allocator,
+                                     &mut self.window,
+                                     debug_ui_presenter,
+                                     &mut ui_action,
+                                     &mut self.ui_model);
         }
 
         self.handle_ui_events(frame, &mut ui_action);
 
-        self.renderer.device.end_commands();
+        self.renderer.device().end_commands();
 
-        self.window.present(&mut self.renderer.device);
+        self.window.present(self.renderer.device_mut());
         self.frame_counter += 1;
-    }
-
-    fn update_stats(&mut self) {
-        let frame = self.current_frame.as_mut().unwrap();
-        if let Some(rendering_time) = self.renderer.shift_rendering_time() {
-            frame.scene_rendering_times.push(rendering_time);
-        }
-
-        if frame.scene_stats.is_empty() && frame.scene_rendering_times.is_empty() {
-            return
-        }
-
-        let zero = RenderStats::default();
-        let aggregate_stats = frame.scene_stats.iter().fold(zero, |sum, item| sum + *item);
-        if !frame.scene_rendering_times.is_empty() {
-            let total_rendering_time = frame.scene_rendering_times
-                                            .iter()
-                                            .fold(RenderTime::default(), |sum, item| sum + *item);
-            self.renderer.debug_ui_presenter.add_sample(aggregate_stats, total_rendering_time);
-        }
     }
 
     fn maybe_take_screenshot(&mut self) {
@@ -535,7 +528,12 @@ impl<W> DemoApp<W> where W: Window {
     }
 
     fn handle_ui_events(&mut self, mut frame: Frame, ui_action: &mut UIAction) {
-        frame.ui_events = self.renderer.debug_ui_presenter.ui_presenter.event_queue.drain();
+        frame.ui_events = self.renderer
+                              .debug_ui_presenter_mut()
+                              .debug_ui_presenter
+                              .ui_presenter
+                              .event_queue
+                              .drain();
 
         self.handle_ui_action(ui_action);
 
@@ -624,6 +622,8 @@ pub struct Options {
     pub input_path: SVGPath,
     pub ui: UIVisibility,
     pub background_color: BackgroundColor,
+    pub high_performance_gpu: bool,
+    pub renderer_level: Option<RendererLevel>,
     hidden_field_for_future_proofing: (),
 }
 
@@ -635,14 +635,16 @@ impl Default for Options {
             input_path: SVGPath::Default,
             ui: UIVisibility::All,
             background_color: BackgroundColor::Light,
+            high_performance_gpu: false,
+            renderer_level: None,
             hidden_field_for_future_proofing: (),
         }
     }
 }
 
 impl Options {
-    fn command_line_overrides(&mut self) {
-        let matches = App::new("tile-svg")
+    pub fn command_line_overrides(&mut self) {
+        let matches = App::new("demo")
             .arg(
                 Arg::with_name("jobs")
                     .short("j")
@@ -682,6 +684,20 @@ impl Options {
                     .help("The background color to use"),
             )
             .arg(
+                Arg::with_name("high-performance-gpu")
+                    .short("g")
+                    .long("high-performance-gpu")
+                    .help("Use the high-performance (discrete) GPU, if available")
+            )
+            .arg(
+                Arg::with_name("level")
+                    .long("level")
+                    .short("l")
+                    .help("Set the renderer feature level as a Direct3D version equivalent")
+                    .takes_value(true)
+                    .possible_values(&["9", "11"])
+            )
+            .arg(
                 Arg::with_name("INPUT")
                     .help("Path to the SVG file to render")
                     .index(1),
@@ -714,9 +730,21 @@ impl Options {
             };
         }
 
+        if matches.is_present("high-performance-gpu") {
+            self.high_performance_gpu = true;
+        }
+
+        if let Some(renderer_level) = matches.value_of("level") {
+            if renderer_level == "11" {
+                self.renderer_level = Some(RendererLevel::D3D11);
+            } else if renderer_level == "9" {
+                self.renderer_level = Some(RendererLevel::D3D9);
+            }
+        }
+
         if let Some(path) = matches.value_of("INPUT") {
             self.input_path = SVGPath::Path(PathBuf::from(path));
-        };
+        }
     }
 }
 
@@ -731,7 +759,7 @@ fn load_scene(resource_loader: &dyn ResourceLoader,
               input_path: &SVGPath,
               viewport_size: Vector2I,
               filter: Option<PatternFilter>)
-              -> (BuiltSVG, Tree) {
+              -> (SVGScene, Tree) {
     let mut data;
     match *input_path {
         SVGPath::Default => data = resource_loader.slurp(DEFAULT_SVG_VIRTUAL_PATH).unwrap(),
@@ -750,7 +778,7 @@ fn load_scene(resource_loader: &dyn ResourceLoader,
 // FIXME(pcwalton): Rework how transforms work in the demo. The transform affects the final
 // composite steps, breaking this approach.
 fn build_svg_tree(tree: &Tree, viewport_size: Vector2I, filter: Option<PatternFilter>)
-                  -> BuiltSVG {
+                  -> SVGScene {
     let mut scene = Scene::new();
     let filter_info = filter.map(|filter| {
         let scale = match filter {
@@ -764,17 +792,17 @@ fn build_svg_tree(tree: &Tree, viewport_size: Vector2I, filter: Option<PatternFi
         FilterInfo { filter, render_target_id, render_target_size }
     });
 
-    let mut built_svg = BuiltSVG::from_tree_and_scene(&tree, scene);
+    let mut built_svg = SVGScene::from_tree_and_scene(&tree, scene);
     if let Some(FilterInfo { filter, render_target_id, render_target_size }) = filter_info {
-        let mut paint = Pattern::from_render_target(render_target_id, render_target_size);
-        paint.set_filter(Some(filter));
-        let paint_id = built_svg.scene.push_paint(&Paint::Pattern(paint));
+        let mut pattern = Pattern::from_render_target(render_target_id, render_target_size);
+        pattern.set_filter(Some(filter));
+        let paint_id = built_svg.scene.push_paint(&Paint::from_pattern(pattern));
 
         let outline = Outline::from_rect(RectI::new(vec2i(0, 0), viewport_size).to_f32());
         let path = DrawPath::new(outline, paint_id);
 
         built_svg.scene.pop_render_target();
-        built_svg.scene.push_path(path);
+        built_svg.scene.push_draw_path(path);
     }
 
     return built_svg;
@@ -790,7 +818,7 @@ fn center_of_window(window_size: &WindowSize) -> Vector2F {
     window_size.device_size().to_f32() * 0.5
 }
 
-fn get_svg_building_message(built_svg: &BuiltSVG) -> String {
+fn get_svg_building_message(built_svg: &SVGScene) -> String {
     if built_svg.result_flags.is_empty() {
         return String::new();
     }
@@ -824,18 +852,11 @@ fn emit_message<W>(
 struct Frame {
     transform: RenderTransform,
     ui_events: Vec<UIEvent>,
-    scene_rendering_times: Vec<RenderTime>,
-    scene_stats: Vec<RenderStats>,
 }
 
 impl Frame {
     fn new(transform: RenderTransform, ui_events: Vec<UIEvent>) -> Frame {
-        Frame {
-            transform,
-            ui_events,
-            scene_rendering_times: vec![],
-            scene_stats: vec![],
-        }
+        Frame { transform, ui_events }
     }
 }
 

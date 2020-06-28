@@ -15,7 +15,9 @@ extern crate bitflags;
 
 use hashbrown::HashMap;
 use pathfinder_color::ColorU;
+use pathfinder_content::dash::OutlineDash;
 use pathfinder_content::fill::FillRule;
+use pathfinder_content::gradient::{ColorStop, Gradient};
 use pathfinder_content::outline::Outline;
 use pathfinder_content::segment::{Segment, SegmentFlags};
 use pathfinder_content::stroke::{LineCap, LineJoin, OutlineStrokeToFill, StrokeStyle};
@@ -26,57 +28,54 @@ use pathfinder_geometry::transform2d::Transform2F;
 use pathfinder_geometry::vector::{Vector2F, vec2f};
 use pathfinder_renderer::paint::Paint;
 use pathfinder_renderer::scene::{ClipPath, ClipPathId, DrawPath, Scene};
+use pathfinder_simd::default::F32x2;
 use std::fmt::{Display, Formatter, Result as FormatResult};
-use usvg::{Color as SvgColor, FillRule as UsvgFillRule, LineCap as UsvgLineCap};
+use usvg::{BaseGradient, Color as SvgColor, FillRule as UsvgFillRule, LineCap as UsvgLineCap};
 use usvg::{LineJoin as UsvgLineJoin, Node, NodeExt, NodeKind, Opacity, Paint as UsvgPaint};
-use usvg::{PathSegment as UsvgPathSegment, Rect as UsvgRect, Transform as UsvgTransform};
-use usvg::{Tree, Visibility};
+use usvg::{PathSegment as UsvgPathSegment, Rect as UsvgRect, SpreadMethod, Stop};
+use usvg::{Transform as UsvgTransform, Tree, Visibility};
 
 const HAIRLINE_STROKE_WIDTH: f32 = 0.0333;
 
-pub struct BuiltSVG {
+pub struct SVGScene {
     pub scene: Scene,
     pub result_flags: BuildResultFlags,
     pub clip_paths: HashMap<String, ClipPathId>,
+    gradients: HashMap<String, GradientInfo>,
 }
 
 bitflags! {
     // NB: If you change this, make sure to update the `Display`
     // implementation as well.
     pub struct BuildResultFlags: u16 {
-        const UNSUPPORTED_CLIP_PATH_NODE       = 0x0001;
-        const UNSUPPORTED_DEFS_NODE            = 0x0002;
-        const UNSUPPORTED_FILTER_NODE          = 0x0004;
-        const UNSUPPORTED_IMAGE_NODE           = 0x0008;
-        const UNSUPPORTED_LINEAR_GRADIENT_NODE = 0x0010;
-        const UNSUPPORTED_MASK_NODE            = 0x0020;
-        const UNSUPPORTED_PATTERN_NODE         = 0x0040;
-        const UNSUPPORTED_RADIAL_GRADIENT_NODE = 0x0080;
-        const UNSUPPORTED_NESTED_SVG_NODE      = 0x0100;
-        const UNSUPPORTED_TEXT_NODE            = 0x0200;
-        const UNSUPPORTED_LINK_PAINT           = 0x0400;
-        const UNSUPPORTED_CLIP_PATH_ATTR       = 0x0800;
-        const UNSUPPORTED_FILTER_ATTR          = 0x1000;
-        const UNSUPPORTED_MASK_ATTR            = 0x2000;
-        const UNSUPPORTED_OPACITY_ATTR         = 0x4000;
+        const UNSUPPORTED_FILTER_NODE            = 0x0001;
+        const UNSUPPORTED_IMAGE_NODE             = 0x0002;
+        const UNSUPPORTED_MASK_NODE              = 0x0004;
+        const UNSUPPORTED_PATTERN_NODE           = 0x0008;
+        const UNSUPPORTED_MULTIPLE_CLIP_PATHS    = 0x0010;
+        const UNSUPPORTED_LINK_PAINT             = 0x0020;
+        const UNSUPPORTED_FILTER_ATTR            = 0x0040;
+        const UNSUPPORTED_MASK_ATTR              = 0x0080;
+        const UNSUPPORTED_GRADIENT_SPREAD_METHOD = 0x0100;
     }
 }
 
-impl BuiltSVG {
+impl SVGScene {
     // TODO(pcwalton): Allow a global transform to be set.
     #[inline]
-    pub fn from_tree(tree: &Tree) -> BuiltSVG {
-        BuiltSVG::from_tree_and_scene(tree, Scene::new())
+    pub fn from_tree(tree: &Tree) -> SVGScene {
+        SVGScene::from_tree_and_scene(tree, Scene::new())
     }
 
     // TODO(pcwalton): Allow a global transform to be set.
-    pub fn from_tree_and_scene(tree: &Tree, scene: Scene) -> BuiltSVG {
+    pub fn from_tree_and_scene(tree: &Tree, scene: Scene) -> SVGScene {
         // TODO(pcwalton): Maybe have a `SVGBuilder` type to hold the clip path IDs and other
-        // transient data separate from `BuiltSVG`?
-        let mut built_svg = BuiltSVG {
+        // transient data separate from `SVGScene`?
+        let mut built_svg = SVGScene {
             scene,
             result_flags: BuildResultFlags::empty(),
             clip_paths: HashMap::new(),
+            gradients: HashMap::new(),
         };
 
         let root = &tree.root();
@@ -104,17 +103,19 @@ impl BuiltSVG {
         match *node.borrow() {
             NodeKind::Group(ref group) => {
                 if group.filter.is_some() {
-                    self.result_flags
-                        .insert(BuildResultFlags::UNSUPPORTED_FILTER_ATTR);
+                    self.result_flags.insert(BuildResultFlags::UNSUPPORTED_FILTER_ATTR);
                 }
                 if group.mask.is_some() {
-                    self.result_flags
-                        .insert(BuildResultFlags::UNSUPPORTED_MASK_ATTR);
+                    self.result_flags.insert(BuildResultFlags::UNSUPPORTED_MASK_ATTR);
                 }
 
                 if let Some(ref clip_path_name) = group.clip_path {
                     if let Some(clip_path_id) = self.clip_paths.get(clip_path_name) {
                         // TODO(pcwalton): Combine multiple clip paths if there's already one.
+                        if state.clip_path.is_some() {
+                            self.result_flags
+                                .insert(BuildResultFlags::UNSUPPORTED_MULTIPLE_CLIP_PATHS);
+                        }
                         state.clip_path = Some(*clip_path_id);
                     }
                 }
@@ -127,6 +128,9 @@ impl BuiltSVG {
                 // TODO(pcwalton): Multiple clip paths.
                 let path = UsvgPathToSegments::new(path.data.iter().cloned());
                 let path = Transform2FPathIter::new(path, &state.transform);
+                if clip_outline.is_some() {
+                    self.result_flags.insert(BuildResultFlags::UNSUPPORTED_MULTIPLE_CLIP_PATHS);
+                }
                 *clip_outline = Some(Outline::from_segments(path));
             }
             NodeKind::Path(ref path) if state.path_destination == PathDestination::Draw &&
@@ -153,7 +157,14 @@ impl BuiltSVG {
                     };
 
                     let path = UsvgPathToSegments::new(path.data.iter().cloned());
-                    let outline = Outline::from_segments(path);
+                    let mut outline = Outline::from_segments(path);
+
+                    if let Some(ref dash_array) = stroke.dasharray {
+                        let dash_array: Vec<f32> = dash_array.iter().map(|&x| x as f32).collect();
+                        let mut dash = OutlineDash::new(&outline, &dash_array, stroke.dashoffset);
+                        dash.dash();
+                        outline = dash.into_outline();
+                    }
 
                     let mut stroke_to_fill = OutlineStrokeToFill::new(&outline, stroke_style);
                     stroke_to_fill.offset();
@@ -191,6 +202,23 @@ impl BuiltSVG {
                     self.process_node(&kid, &state, clip_outline);
                 }
             }
+            NodeKind::LinearGradient(ref svg_linear_gradient) => {
+                let from = vec2f(svg_linear_gradient.x1 as f32, svg_linear_gradient.y1 as f32);
+                let to   = vec2f(svg_linear_gradient.x2 as f32, svg_linear_gradient.y2 as f32);
+                let gradient = Gradient::linear_from_points(from, to);
+                self.add_gradient(gradient,
+                                  svg_linear_gradient.id.clone(),
+                                  &svg_linear_gradient.base)
+            }
+            NodeKind::RadialGradient(ref svg_radial_gradient) => {
+                let from = vec2f(svg_radial_gradient.fx as f32, svg_radial_gradient.fy as f32);
+                let to   = vec2f(svg_radial_gradient.cx as f32, svg_radial_gradient.cy as f32);
+                let radii = F32x2::new(0.0, svg_radial_gradient.r.value() as f32);
+                let gradient = Gradient::radial(LineSegment2F::new(from, to), radii);
+                self.add_gradient(gradient,
+                                  svg_radial_gradient.id.clone(),
+                                  &svg_radial_gradient.base)
+            }
             NodeKind::Filter(..) => {
                 self.result_flags
                     .insert(BuildResultFlags::UNSUPPORTED_FILTER_NODE);
@@ -198,10 +226,6 @@ impl BuiltSVG {
             NodeKind::Image(..) => {
                 self.result_flags
                     .insert(BuildResultFlags::UNSUPPORTED_IMAGE_NODE);
-            }
-            NodeKind::LinearGradient(..) => {
-                self.result_flags
-                    .insert(BuildResultFlags::UNSUPPORTED_LINEAR_GRADIENT_NODE);
             }
             NodeKind::Mask(..) => {
                 self.result_flags
@@ -211,15 +235,26 @@ impl BuiltSVG {
                 self.result_flags
                     .insert(BuildResultFlags::UNSUPPORTED_PATTERN_NODE);
             }
-            NodeKind::RadialGradient(..) => {
-                self.result_flags
-                    .insert(BuildResultFlags::UNSUPPORTED_RADIAL_GRADIENT_NODE);
-            }
-            NodeKind::Svg(..) => {
-                self.result_flags
-                    .insert(BuildResultFlags::UNSUPPORTED_NESTED_SVG_NODE);
-            }
+            NodeKind::Svg(..) => unreachable!(),
         }
+    }
+
+    fn add_gradient(&mut self,
+                    mut gradient: Gradient,
+                    id: String,
+                    usvg_base_gradient: &BaseGradient) {
+        for stop in &usvg_base_gradient.stops {
+            gradient.add(ColorStop::from_usvg_stop(stop));
+        }
+
+        if usvg_base_gradient.spread_method != SpreadMethod::Pad {
+            self.result_flags.insert(BuildResultFlags::UNSUPPORTED_GRADIENT_SPREAD_METHOD);
+        }
+
+        let transform = usvg_transform_to_transform_2d(&usvg_base_gradient.transform);
+
+        // TODO(pcwalton): What should we do with `gradientUnits`?
+        self.gradients.insert(id, GradientInfo { gradient, transform });
     }
 
     fn push_draw_path(&mut self,
@@ -233,6 +268,7 @@ impl BuiltSVG {
         let paint = Paint::from_svg_paint(paint,
                                           &state.transform,
                                           opacity,
+                                          &self.gradients,
                                           &mut self.result_flags);
         let style = self.scene.push_paint(&paint);
         let fill_rule = FillRule::from_usvg_fill_rule(fill_rule);
@@ -240,7 +276,7 @@ impl BuiltSVG {
         path.set_clip_path(state.clip_path);
         path.set_fill_rule(fill_rule);
         path.set_name(name);
-        self.scene.push_path(path);
+        self.scene.push_draw_path(path);
     }
 }
 
@@ -267,21 +303,15 @@ impl Display for BuildResultFlags {
 
         // Must match the order in `BuildResultFlags`.
         static NAMES: &'static [&'static str] = &[
-            "<clipPath>",
-            "<defs>",
             "<filter>",
             "<image>",
-            "<linearGradient>",
             "<mask>",
             "<pattern>",
-            "<radialGradient>",
-            "nested <svg>",
-            "<text>",
-            "paint server element",
-            "clip-path attribute",
+            "multiple clip paths",
+            "non-color paint",
             "filter attribute",
             "mask attribute",
-            "opacity attribute",
+            "gradient spread method",
         ];
     }
 }
@@ -290,6 +320,7 @@ trait PaintExt {
     fn from_svg_paint(svg_paint: &UsvgPaint,
                       transform: &Transform2F,
                       opacity: Opacity,
+                      gradients: &HashMap<String, GradientInfo>,
                       result_flags: &mut BuildResultFlags)
                       -> Self;
 }
@@ -299,19 +330,31 @@ impl PaintExt for Paint {
     fn from_svg_paint(svg_paint: &UsvgPaint,
                       transform: &Transform2F,
                       opacity: Opacity,
+                      gradients: &HashMap<String, GradientInfo>,
                       result_flags: &mut BuildResultFlags)
                       -> Paint {
-        // TODO(pcwalton): Support gradients.
-        let mut paint = Paint::Color(match *svg_paint {
-            UsvgPaint::Color(color) => ColorU::from_svg_color(color),
-            UsvgPaint::Link(_) => {
-                // TODO(pcwalton)
-                result_flags.insert(BuildResultFlags::UNSUPPORTED_LINK_PAINT);
-                ColorU::black()
+        let mut paint;
+        match *svg_paint {
+            UsvgPaint::Color(color) => paint = Paint::from_color(ColorU::from_svg_color(color)),
+            UsvgPaint::Link(ref id) => {
+                match gradients.get(id) {
+                    Some(ref gradient_info) => {
+                        paint = Paint::from_gradient(gradient_info.gradient.clone());
+                        paint.apply_transform(&(*transform * gradient_info.transform));
+                    }
+                    None => {
+                        // TODO(pcwalton)
+                        result_flags.insert(BuildResultFlags::UNSUPPORTED_LINK_PAINT);
+                        paint = Paint::from_color(ColorU::black());
+                    }
+                }
             }
-        });
-        paint.apply_transform(transform);
-        paint.apply_opacity(opacity.value() as f32);
+        }
+
+        let mut base_color = paint.base_color().to_f32();
+        base_color.set_a(base_color.a() * opacity.value() as f32);
+        paint.set_base_color(base_color.to_u8());
+
         paint
     }
 }
@@ -322,14 +365,8 @@ fn usvg_rect_to_euclid_rect(rect: &UsvgRect) -> RectF {
 }
 
 fn usvg_transform_to_transform_2d(transform: &UsvgTransform) -> Transform2F {
-    Transform2F::row_major(
-        transform.a as f32,
-        transform.b as f32,
-        transform.c as f32,
-        transform.d as f32,
-        transform.e as f32,
-        transform.f as f32,
-    )
+    Transform2F::row_major(transform.a as f32, transform.c as f32, transform.e as f32,
+                           transform.b as f32, transform.d as f32, transform.f as f32)
 }
 
 struct UsvgPathToSegments<I>
@@ -470,6 +507,18 @@ impl FillRuleExt for FillRule {
     }
 }
 
+trait ColorStopExt {
+    fn from_usvg_stop(usvg_stop: &Stop) -> Self;
+}
+
+impl ColorStopExt for ColorStop {
+    fn from_usvg_stop(usvg_stop: &Stop) -> ColorStop {
+        let mut color = ColorU::from_svg_color(usvg_stop.color);
+        color.a = (usvg_stop.opacity.value() * 255.0) as u8;
+        ColorStop::new(color, usvg_stop.offset.value() as f32)
+    }
+}
+
 #[derive(Clone)]
 struct State {
     // Where paths are being appended to.
@@ -495,4 +544,9 @@ enum PathDestination {
     Draw,
     Defs,
     Clip,
+}
+
+struct GradientInfo {
+    gradient: Gradient,
+    transform: Transform2F,
 }

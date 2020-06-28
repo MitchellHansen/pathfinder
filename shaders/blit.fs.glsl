@@ -11,7 +11,10 @@
 // except according to those terms.
 
 precision highp float;
+
+#ifdef GL_ES
 precision highp sampler2D;
+#endif
 
 uniform sampler2D uSrc;
 
@@ -21,5 +24,5 @@ out vec4 oFragColor;
 
 void main() {
     vec4 color = texture(uSrc, vTexCoord);
-    oFragColor = vec4(color.rgb * color.a, color.a);
+    oFragColor = color;
 }
