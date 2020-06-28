@@ -10,6 +10,7 @@ members = [
     "demo/native",
     "examples/canvas_glutin_minimal",
     "examples/canvas_metal_minimal",
+    "examples/canvas_vulkan_minimal",
     "examples/canvas_minimal",
     "examples/canvas_moire",
     "examples/canvas_nanovg",
@@ -34,6 +35,7 @@ members = [
     "utils/svg-to-skia",
     "utils/convert",
     "webgl",
+    "vulkan",
 ]
 
 default-members = [
@@ -43,6 +45,7 @@ default-members = [
     "demo/common",
     "demo/native",
     "examples/canvas_glutin_minimal",
+    "examples/canvas_vulkan_minimal",
     "examples/canvas_minimal",
     "examples/canvas_moire",
     "examples/canvas_text",
@@ -63,6 +66,7 @@ default-members = [
     "utils/gamma-lut",
     "utils/svg-to-skia",
     "utils/convert",
+    "vulkan",
 ]
 
 [patch.crates-io]
